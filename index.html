@@ -780,15 +780,19 @@
       const vehicles = createVehicles();
       window.__trafficDebug = {
         getRouteStats() {
-          const lengths = routeLibrary.map((route) => route.totalLength);
-          const pointCounts = routeLibrary.map((route) => route.points.length);
+          const outgoingCounts = Array.from(routeLibrary.graph.adjacency.values()).map((edges) => edges.length);
+          const activeSpeeds = vehicles.map((vehicle) => vehicle.speed);
           return {
-            routeCount: routeLibrary.length,
-            minLength: Math.round(Math.min(...lengths)),
-            maxLength: Math.round(Math.max(...lengths)),
-            averageLength: Math.round(lengths.reduce((sum, value) => sum + value, 0) / lengths.length),
-            minPoints: Math.min(...pointCounts),
-            maxPoints: Math.max(...pointCounts),
+            mode: "intersection-random-walk",
+            graphRoadCount: routeLibrary.graph.routeRoadCount,
+            graphSegmentCount: routeLibrary.graph.edgeCount,
+            graphConnectorCount: routeLibrary.graph.connectorCount,
+            graphPrunedNodeCount: routeLibrary.graph.prunedNodeCount,
+            graphNodeCount: routeLibrary.graph.nodes.size,
+            seedNodeCount: routeLibrary.seedNodes.length,
+            targetNodeCount: routeLibrary.targetNodes.length,
+            averageOutgoing: Math.round((outgoingCounts.reduce((sum, value) => sum + value, 0) / outgoingCounts.length) * 10) / 10,
+            averageSpeed: Math.round(activeSpeeds.reduce((sum, value) => sum + value, 0) / activeSpeeds.length),
             vehicleCount: vehicles.length
           };
         }
@@ -935,26 +939,15 @@
       function createRouteLibrary() {
         const graph = buildRoadGraph();
         const seedNodes = collectRouteSeedNodes(graph);
-        const routes = [];
-
-        for (let index = 0; index < Math.max(32, appData.metrics.totalVehicles + 8); index += 1) {
-          const route = buildGraphRoute(graph, seedNodes[index % seedNodes.length], index);
-          if (route && route.totalLength > 900) {
-            routes.push(route);
-          }
-        }
-
-        if (routes.length) {
-          return routes;
-        }
-
-        return routeTemplates.map((segments, index) => buildRoute(index, segments));
+        const targetNodes = collectRouteTargetNodes(graph, seedNodes);
+        return { graph, seedNodes, targetNodes };
       }
 
       function buildRoadGraph() {
         const nodes = new Map();
         const adjacency = new Map();
-        const routeRoads = appData.roads.filter((road) => road.rank >= 4 && road.length >= 14 && road.points.length > 1);
+        let edgeCount = 0;
+        const routeRoads = appData.roads.filter((road) => road.rank >= 2 && road.length >= 8 && road.points.length > 1);
 
         function nodeKey(point) {
           return `${Math.round(point[0] / 3)}:${Math.round(point[1] / 3)}`;
@@ -980,14 +973,185 @@
             const from = ensureNode(start);
             const to = ensureNode(end);
             const edgeId = `${road.id}:${index}`;
-            const forward = { id: edgeId, roadId: road.id, from, to, rank: road.rank, length, points: [start, end] };
-            const backward = { id: edgeId, roadId: road.id, from: to, to: from, rank: road.rank, length, points: [end, start] };
+            const forward = createTrafficEdge(`${edgeId}:f`, road, from, to, start, end, length);
+            const backward = createTrafficEdge(`${edgeId}:b`, road, to, from, end, start, length);
             adjacency.get(from).push(forward);
             adjacency.get(to).push(backward);
+            edgeCount += 1;
           }
         });
 
-        return { nodes, adjacency };
+        const connectorCount = addNearbyTrafficConnectors(nodes, adjacency);
+        const prunedNodeCount = 0;
+        return {
+          nodes,
+          adjacency,
+          edgeCount,
+          connectorCount,
+          prunedNodeCount,
+          routeRoadCount: routeRoads.length
+        };
+      }
+
+      function createTrafficEdge(edgeId, road, from, to, start, end, length) {
+        return {
+          id: edgeId,
+          roadId: road.id,
+          from,
+          to,
+          rank: road.rank,
+          highway: road.highway,
+          synthetic: Boolean(road.synthetic),
+          length,
+          points: [start, end],
+          vector: { x: end[0] - start[0], y: end[1] - start[1] }
+        };
+      }
+
+      function addNearbyTrafficConnectors(nodes, adjacency) {
+        const cellSize = 6;
+        const buckets = new Map();
+        const connectorUse = new Map();
+        const candidates = [];
+
+        function bucketKey(x, y) {
+          return `${Math.floor(x / cellSize)}:${Math.floor(y / cellSize)}`;
+        }
+
+        nodes.forEach((node) => {
+          const key = bucketKey(node.x, node.y);
+          if (!buckets.has(key)) {
+            buckets.set(key, []);
+          }
+          buckets.get(key).push(node);
+        });
+
+        nodes.forEach((node) => {
+          const cellX = Math.floor(node.x / cellSize);
+          const cellY = Math.floor(node.y / cellSize);
+          for (let dx = -1; dx <= 1; dx += 1) {
+            for (let dy = -1; dy <= 1; dy += 1) {
+              const bucket = buckets.get(`${cellX + dx}:${cellY + dy}`) || [];
+              bucket.forEach((other) => {
+                if (node.id >= other.id || hasTrafficConnection(adjacency, node.id, other.id)) {
+                  return;
+                }
+                const firstDegree = (adjacency.get(node.id) || []).length;
+                const secondDegree = (adjacency.get(other.id) || []).length;
+                const gap = distance(node, other);
+                if (gap > 4.2 || gap < 1.2) {
+                  return;
+                }
+                const firstProfile = dominantNodeRoadProfile(adjacency, node.id);
+                const secondProfile = dominantNodeRoadProfile(adjacency, other.id);
+                candidates.push({
+                  from: node,
+                  to: other,
+                  length: gap,
+                  rank: Math.max(2, Math.round((firstProfile.rank + secondProfile.rank) / 2)),
+                  highway: betterRoadClass(firstProfile.highway, secondProfile.highway)
+                });
+              });
+            }
+          }
+        });
+
+        candidates.sort((a, b) => a.length - b.length);
+        let added = 0;
+        candidates.forEach((candidate) => {
+          const fromCount = connectorUse.get(candidate.from.id) || 0;
+          const toCount = connectorUse.get(candidate.to.id) || 0;
+          if (fromCount >= 1 || toCount >= 1 || hasTrafficConnection(adjacency, candidate.from.id, candidate.to.id)) {
+            return;
+          }
+          const road = {
+            id: `connector:${candidate.from.id}:${candidate.to.id}`,
+            rank: candidate.rank,
+            highway: candidate.highway,
+            synthetic: true
+          };
+          const start = [candidate.from.x, candidate.from.y];
+          const end = [candidate.to.x, candidate.to.y];
+          adjacency.get(candidate.from.id).push(createTrafficEdge(`${road.id}:f`, road, candidate.from.id, candidate.to.id, start, end, candidate.length));
+          adjacency.get(candidate.to.id).push(createTrafficEdge(`${road.id}:b`, road, candidate.to.id, candidate.from.id, end, start, candidate.length));
+          connectorUse.set(candidate.from.id, fromCount + 1);
+          connectorUse.set(candidate.to.id, toCount + 1);
+          added += 1;
+        });
+
+        return added;
+      }
+
+      function hasTrafficConnection(adjacency, from, to) {
+        return (adjacency.get(from) || []).some((edge) => edge.to === to);
+      }
+
+      function pruneDeadEndTrafficGraph(nodes, adjacency) {
+        const neighbors = new Map();
+        nodes.forEach((node, nodeId) => {
+          neighbors.set(nodeId, new Set());
+        });
+        adjacency.forEach((edges, nodeId) => {
+          edges.forEach((edge) => {
+            if (nodes.has(edge.to)) {
+              neighbors.get(nodeId).add(edge.to);
+              neighbors.get(edge.to).add(nodeId);
+            }
+          });
+        });
+
+        const queue = [];
+        neighbors.forEach((linkedNodes, nodeId) => {
+          if (linkedNodes.size <= 1) {
+            queue.push(nodeId);
+          }
+        });
+
+        const removed = new Set();
+        while (queue.length) {
+          const nodeId = queue.shift();
+          if (removed.has(nodeId)) {
+            continue;
+          }
+          const linkedNodes = neighbors.get(nodeId);
+          if (!linkedNodes || linkedNodes.size > 1) {
+            continue;
+          }
+          removed.add(nodeId);
+          linkedNodes.forEach((neighborId) => {
+            const neighborLinks = neighbors.get(neighborId);
+            if (!neighborLinks) {
+              return;
+            }
+            neighborLinks.delete(nodeId);
+            if (!removed.has(neighborId) && neighborLinks.size <= 1) {
+              queue.push(neighborId);
+            }
+          });
+          linkedNodes.clear();
+        }
+
+        removed.forEach((nodeId) => {
+          nodes.delete(nodeId);
+          adjacency.delete(nodeId);
+        });
+        adjacency.forEach((edges, nodeId) => {
+          adjacency.set(nodeId, edges.filter((edge) => nodes.has(edge.to)));
+        });
+        return removed.size;
+      }
+
+      function dominantNodeRoadProfile(adjacency, nodeId) {
+        const edges = adjacency.get(nodeId) || [];
+        if (!edges.length) {
+          return { rank: 2, highway: "residential" };
+        }
+        return edges.reduce((best, edge) => (edge.rank > best.rank ? edge : best), edges[0]);
+      }
+
+      function betterRoadClass(first, second) {
+        const order = ["residential", "unclassified", "tertiary", "secondary", "primary", "trunk", "motorway"];
+        return order.indexOf(first) >= order.indexOf(second) ? first : second;
       }
 
       function collectRouteSeedNodes(graph) {
@@ -1016,10 +1180,47 @@
             }
           });
 
+        appData.roads
+          .filter((road) => road.rank >= 2 && road.rank <= 3 && road.length > 55)
+          .sort((a, b) => b.length - a.length)
+          .slice(0, 36)
+          .forEach((road) => {
+            const closest = findClosestGraphNode(graph, road.points[Math.floor(road.points.length / 2)]);
+            if (closest && !seeds.includes(closest)) {
+              seeds.push(closest);
+            }
+          });
+
         if (!seeds.length) {
           seeds.push(...graph.nodes.keys());
         }
         return seeds;
+      }
+
+      function collectRouteTargetNodes(graph, seedNodes) {
+        const targets = [];
+        graph.adjacency.forEach((edges, nodeId) => {
+          if (!graph.nodes.has(nodeId)) {
+            return;
+          }
+          const realEdges = edges.filter((edge) => !edge.synthetic);
+          const hasMainRoad = realEdges.some((edge) => edge.rank >= 6);
+          const hasChoice = realEdges.length >= 3;
+          if (hasChoice && (hasMainRoad || edges.length >= 4) && !targets.includes(nodeId)) {
+            targets.push(nodeId);
+          }
+        });
+        seedNodes.forEach((nodeId) => {
+          const edges = graph.adjacency.get(nodeId) || [];
+          const realEdges = edges.filter((edge) => !edge.synthetic);
+          if (realEdges.length >= 3 && !targets.includes(nodeId)) {
+            targets.push(nodeId);
+          }
+        });
+        if (targets.length) {
+          return targets;
+        }
+        return [...graph.nodes.keys()];
       }
 
       function findClosestGraphNode(graph, point) {
@@ -1035,126 +1236,34 @@
         return best;
       }
 
-      function buildGraphRoute(graph, seedNode, routeIndex) {
-        let current = seedNode;
-        let previous = null;
-        let previousVector = null;
-        const points = [];
-        const visitedEdges = new Map();
-        const targetLength = 1900 + (routeIndex % 9) * 240;
-        let traveled = 0;
-        let guard = 0;
-
-        const startNode = graph.nodes.get(current);
-        if (!startNode) {
-          return null;
-        }
-        points.push([startNode.x, startNode.y]);
-
-        while (guard < 220 && traveled < targetLength) {
-          guard += 1;
-          const candidates = (graph.adjacency.get(current) || []).filter((edge) => edge.to !== previous || (graph.adjacency.get(current) || []).length === 1);
-          if (!candidates.length) {
-            break;
-          }
-
-          const chosen = chooseRouteEdge(candidates, previousVector, visitedEdges, routeIndex + guard);
-          const tail = chosen.points[chosen.points.length - 1];
-          const head = chosen.points[0];
-          points.push(...chosen.points.slice(1));
-          traveled += chosen.length;
-          visitedEdges.set(chosen.id, (visitedEdges.get(chosen.id) || 0) + 1);
-          previous = current;
-          current = chosen.to;
-          previousVector = { x: tail[0] - head[0], y: tail[1] - head[1] };
-        }
-
-        if (points.length < 28 || traveled < 700) {
-          return null;
-        }
-
-        // Return over the whole corridor, not over one short road segment. This makes the
-        // route closed for animation while avoiding tiny back-and-forth jitter.
-        points.push(...points.slice(1, -1).reverse());
-        return createPolyline(dedupeRoutePoints(points));
-      }
-
-      function chooseRouteEdge(candidates, previousVector, visitedEdges, salt) {
-        let best = candidates[0];
-        let bestScore = -Infinity;
-        candidates.forEach((edge, index) => {
-          const start = edge.points[0];
-          const end = edge.points[edge.points.length - 1];
-          const vector = { x: end[0] - start[0], y: end[1] - start[1] };
-          const continuity = previousVector ? vectorAlignment(previousVector, vector) : 0;
-          const repeatPenalty = (visitedEdges.get(edge.id) || 0) * 26;
-          const deterministicNoise = (((salt + 3) * (index + 11) * 9301) % 97) / 97;
-          const score = edge.rank * 12 + Math.min(edge.length, 80) * 0.18 + continuity * 18 + deterministicNoise * 9 - repeatPenalty;
-          if (score > bestScore) {
-            best = edge;
-            bestScore = score;
-          }
-        });
-        return best;
-      }
-
       function vectorAlignment(first, second) {
         const left = Math.hypot(first.x, first.y) || 1;
         const right = Math.hypot(second.x, second.y) || 1;
         return (first.x * second.x + first.y * second.y) / (left * right);
       }
 
-      function dedupeRoutePoints(points) {
-        const routePoints = [];
-        points.forEach((point) => {
-          const previous = routePoints[routePoints.length - 1];
-          if (!previous || distance(previous, point) > 1.5) {
-            routePoints.push(point);
-          }
-        });
-        return routePoints;
-      }
-
-      function buildRoute(index, segments) {
-        const points = [];
-        segments.forEach((segmentId, segmentIndex) => {
-          const road = roadLookup.get(segmentId);
-          if (!road) {
-            return;
-          }
-          const reverse = (index + segmentIndex) % 2 === 1;
-          const segmentPoints = reverse ? [...road.points].reverse() : road.points;
-          if (!points.length) {
-            points.push(...segmentPoints);
-            return;
-          }
-          const last = points[points.length - 1];
-          const first = segmentPoints[0];
-          if (distance(last, first) < 2) {
-            points.push(...segmentPoints.slice(1));
-          } else {
-            points.push(...createConnector(last, first), ...segmentPoints.slice(1));
-          }
-        });
-        if (segments.length === 1 && points.length > 2) {
-          points.push(...points.slice(1, -1).reverse());
-        }
-        return createPolyline(points);
-      }
-
       function createVehicles() {
         const vehiclesList = [];
+        const graph = routeLibrary.graph;
         for (let index = 0; index < appData.metrics.totalVehicles; index += 1) {
-          const route = routeLibrary[index % routeLibrary.length];
-          const startProgress = ((index * 137) % 1000) / 1000 * route.totalLength;
-          const position = sampleRoute(route, startProgress);
+          const seedNode = routeLibrary.seedNodes[index % routeLibrary.seedNodes.length];
+          const currentEdge = chooseInitialTrafficEdge(graph, seedNode, index);
+          const edgeProgress = currentEdge ? ((index * 137) % 1000) / 1000 * currentEdge.length : 0;
+          const fallbackNode = graph.nodes.get(seedNode) || { x: SCENE_WIDTH / 2, y: SCENE_HEIGHT / 2 };
+          const position = currentEdge ? sampleEdge(currentEdge, edgeProgress) : { x: fallbackNode.x, y: fallbackNode.y };
           const district = getDistrictByPoint(position.x, position.y);
           const chain = district ? chainLookup.get(district.chainId) : appData.chains[0];
           vehiclesList.push({
             id: `V-${String(index + 1).padStart(3, "0")}`,
-            route,
-            progress: startProgress,
-            speed: 58 + (index % 7) * 11,
+            currentEdge,
+            edgeProgress,
+            previousNode: currentEdge ? currentEdge.from : null,
+            previousEdgeId: currentEdge ? currentEdge.id : null,
+            recentEdges: currentEdge ? [currentEdge.id] : [],
+            recentNodes: currentEdge ? [currentEdge.from, currentEdge.to] : [seedNode],
+            plannedEdges: [],
+            personality: 0.88 + (index % 6) * 0.055,
+            speed: currentEdge ? getVehicleCruiseSpeed(currentEdge, 0.88 + (index % 6) * 0.055) : 0,
             radius: 4 + (index % 3),
             trail: [],
             position,
@@ -1163,11 +1272,656 @@
             nextDistrictId: district ? district.id : null,
             glowColor: chain.color,
             transferId: null,
+            stopUntil: 0,
+            slowUntil: 0,
+            slowFactor: 1,
+            turnSlowdownUntil: 0,
+            turnSlowFactor: 1,
+            consecutiveTurns: 0,
+            lastTurnTime: -10000,
+            nextIncidentCheck: performance.now() + 1600 + index * 380,
             lastTransferTime: -10000,
             lastBoundaryTime: -10000
           });
         }
         return vehiclesList;
+      }
+
+      function chooseInitialTrafficEdge(graph, seedNode, salt) {
+        let candidates = preferRealTrafficEdges(graph.adjacency.get(seedNode) || []);
+        if (!candidates.length) {
+          const fallback = Array.from(graph.adjacency.entries()).find((entry) => entry[1].length);
+          candidates = fallback ? preferRealTrafficEdges(fallback[1]) : [];
+        }
+        if (!candidates.length) {
+          return null;
+        }
+        return weightedChoice(candidates.map((edge, index) => ({
+          item: edge,
+          weight: roadPreference(edge) * (edge.synthetic ? 0.08 : 1) * (0.82 + (((salt + 5) * (index + 13)) % 19) / 30)
+        })));
+      }
+
+      function advanceVehicle(vehicle, dt, timestamp, index) {
+        if (!vehicle.currentEdge) {
+          vehicle.speed = 0;
+          return;
+        }
+
+        maybeStartTrafficSlowdown(vehicle, timestamp);
+        let speed = getVehicleCruiseSpeed(vehicle.currentEdge, vehicle.personality);
+        if (timestamp < vehicle.turnSlowdownUntil) {
+          speed *= vehicle.turnSlowFactor;
+        }
+        if (timestamp < vehicle.slowUntil) {
+          speed *= vehicle.slowFactor;
+        }
+        if (timestamp < vehicle.stopUntil && !isElevatedOrExpressway(vehicle.currentEdge)) {
+          speed = 0;
+        }
+        vehicle.speed = speed;
+
+        let remaining = speed * dt;
+        let guard = 0;
+        while (remaining > 0 && guard < 8 && vehicle.currentEdge) {
+          guard += 1;
+          const edgeRemaining = Math.max(0, vehicle.currentEdge.length - vehicle.edgeProgress);
+          if (remaining < edgeRemaining) {
+            vehicle.edgeProgress += remaining;
+            remaining = 0;
+            break;
+          }
+
+          remaining -= edgeRemaining;
+          vehicle.edgeProgress = vehicle.currentEdge.length;
+          const incomingEdge = vehicle.currentEdge;
+          const arrivalNode = incomingEdge.to;
+          const nextEdge = chooseNextTrafficEdge(routeLibrary.graph, arrivalNode, vehicle, incomingEdge, index + guard);
+          if (!nextEdge) {
+            vehicle.speed = 0;
+            remaining = 0;
+            break;
+          }
+
+          const alignment = vectorAlignment(incomingEdge.vector, nextEdge.vector);
+          vehicle.previousNode = incomingEdge.from;
+          vehicle.previousEdgeId = incomingEdge.id;
+          vehicle.currentEdge = nextEdge;
+          vehicle.edgeProgress = 0;
+          rememberVehiclePath(vehicle, nextEdge);
+
+          updateTurnSlowdown(vehicle, alignment, timestamp);
+          maybeStopAtIntersection(vehicle, arrivalNode, incomingEdge, nextEdge, alignment, timestamp);
+          if (timestamp < vehicle.stopUntil) {
+            remaining = 0;
+          }
+        }
+
+        vehicle.position = sampleEdge(vehicle.currentEdge, vehicle.edgeProgress);
+      }
+
+      function chooseNextTrafficEdge(graph, nodeId, vehicle, incomingEdge, salt) {
+        const outgoing = graph.adjacency.get(nodeId) || [];
+        if (!outgoing.length) {
+          return null;
+        }
+
+        const previousNode = incomingEdge.from;
+        vehicle.plannedEdges = [];
+
+        let candidates = outgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.18);
+        if (!candidates.length) {
+          candidates = outgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.48);
+        }
+        if (!candidates.length) {
+          candidates = outgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.82);
+        }
+        if (!candidates.length) {
+          const escapeEdge = createShortEscapeEdge(graph, nodeId, incomingEdge, previousNode);
+          if (escapeEdge) {
+            return escapeEdge;
+          }
+        }
+        if (!candidates.length) {
+          candidates = outgoing;
+        }
+        candidates = preferRealTrafficEdges(candidates);
+
+        return weightedChoice(candidates.map((edge, index) => {
+          const alignment = vectorAlignment(incomingEdge.vector, edge.vector);
+          let weight = roadPreference(edge);
+          weight *= 0.7 + Math.max(0, alignment) * 1.9;
+          weight *= rankTransitionPreference(incomingEdge, edge, alignment);
+          if (alignment < -0.55) {
+            weight *= 0.003;
+          } else if (alignment < -0.15) {
+            weight *= 0.045;
+          } else if (alignment < 0.25) {
+            weight *= 0.48;
+          }
+          if (edge.roadId === incomingEdge.roadId && alignment > 0.35) {
+            weight *= incomingEdge.rank >= 6 ? 2.8 : 1.6;
+          }
+          if (vehicle.recentEdges.includes(edge.id)) {
+            weight *= 0.12;
+          }
+          if (vehicle.recentNodes.includes(edge.to)) {
+            weight *= 0.2;
+          }
+          if (edge.synthetic) {
+            weight *= 0.16;
+          }
+          weight *= 0.84 + rng() * 0.36 + (((salt + 7) * (index + 17)) % 11) / 80;
+          return { item: edge, weight: Math.max(0.01, weight) };
+        }));
+      }
+
+      function createShortEscapeEdge(graph, nodeId, incomingEdge, previousNode) {
+        const node = graph.nodes.get(nodeId);
+        if (!node) {
+          return null;
+        }
+        const maxGap = incomingEdge.rank >= 6 ? 15 : 12;
+        let best = null;
+        let bestScore = -Infinity;
+
+        graph.nodes.forEach((candidate) => {
+          if (candidate.id === nodeId || candidate.id === previousNode || hasTrafficConnection(graph.adjacency, nodeId, candidate.id)) {
+            return;
+          }
+          const gap = distance(node, candidate);
+          if (gap < 1.2 || gap > maxGap) {
+            return;
+          }
+          const exits = (graph.adjacency.get(candidate.id) || []).filter((edge) => edge.to !== nodeId && edge.to !== previousNode);
+          if (!exits.length) {
+            return;
+          }
+          const bridgeVector = { x: candidate.x - node.x, y: candidate.y - node.y };
+          const bridgeAlignment = vectorAlignment(incomingEdge.vector, bridgeVector);
+          if (bridgeAlignment < -0.75) {
+            return;
+          }
+          const bestExit = exits.reduce((bestEdge, edge) => {
+            const edgeScore = vectorAlignment(incomingEdge.vector, edge.vector) + roadPreference(edge) * 0.28 - (edge.synthetic ? 0.8 : 0);
+            const bestScoreValue = vectorAlignment(incomingEdge.vector, bestEdge.vector) + roadPreference(bestEdge) * 0.28 - (bestEdge.synthetic ? 0.8 : 0);
+            return edgeScore > bestScoreValue ? edge : bestEdge;
+          }, exits[0]);
+          const exitAlignment = vectorAlignment(incomingEdge.vector, bestExit.vector);
+          const score = roadPreference(bestExit) * 1.2 + Math.max(0, exitAlignment) * 3 + Math.max(0, bridgeAlignment) * 2 - gap * 0.8;
+          if (score > bestScore) {
+            best = { node: candidate, exit: bestExit, length: gap };
+            bestScore = score;
+          }
+        });
+
+        if (!best) {
+          return null;
+        }
+        const road = {
+          id: `escape:${nodeId}:${best.node.id}:${incomingEdge.id}`,
+          rank: Math.max(2, best.exit.rank),
+          highway: best.exit.highway,
+          synthetic: true
+        };
+        return createTrafficEdge(
+          `${road.id}:f`,
+          road,
+          nodeId,
+          best.node.id,
+          [node.x, node.y],
+          [best.node.x, best.node.y],
+          best.length
+        );
+      }
+
+      function takePlannedTrafficEdge(graph, nodeId, vehicle, incomingEdge) {
+        while (vehicle.plannedEdges.length) {
+          const edge = vehicle.plannedEdges.shift();
+          if (edge.from !== nodeId || !hasTrafficConnection(graph.adjacency, edge.from, edge.to)) {
+            vehicle.plannedEdges = [];
+            return null;
+          }
+          const alignment = vectorAlignment(incomingEdge.vector, edge.vector);
+          if (edge.to !== incomingEdge.from && alignment > -0.82) {
+            return edge;
+          }
+          vehicle.plannedEdges = [];
+          return null;
+        }
+        return null;
+      }
+
+      function planTrafficRoute(graph, nodeId, vehicle, incomingEdge, salt) {
+        const targets = selectTrafficRouteTargets(graph, nodeId, vehicle, salt);
+        if (!targets.length) {
+          return [];
+        }
+        return findTrafficPath(graph, nodeId, new Set(targets), vehicle, incomingEdge);
+      }
+
+      function selectTrafficRouteTargets(graph, nodeId, vehicle, salt) {
+        const startNode = graph.nodes.get(nodeId);
+        if (!startNode) {
+          return [];
+        }
+        const pool = routeLibrary.targetNodes.length ? routeLibrary.targetNodes : [...graph.nodes.keys()];
+        const targets = [];
+        const attempts = Math.min(pool.length, 42);
+        for (let attempt = 0; attempt < attempts && targets.length < 10; attempt += 1) {
+          const index = (salt * 37 + attempt * 53 + Math.floor(rng() * pool.length)) % pool.length;
+          const targetId = pool[index];
+          const targetNode = graph.nodes.get(targetId);
+          if (!targetNode || targetId === nodeId || targets.includes(targetId) || vehicle.recentNodes.includes(targetId)) {
+            continue;
+          }
+          if (distance(startNode, targetNode) < 220 && attempt < attempts - 8) {
+            continue;
+          }
+          targets.push(targetId);
+        }
+        return targets;
+      }
+
+      function findTrafficPath(graph, startNodeId, targetNodes, vehicle, incomingEdge) {
+        const minTravelDistance = 180;
+        const maxTravelDistance = 1600;
+        const maxIterations = 2600;
+        const startRecord = {
+          nodeId: startNodeId,
+          previousNode: incomingEdge.from,
+          previousVector: incomingEdge.vector,
+          previousEdge: incomingEdge,
+          edge: null,
+          parent: null,
+          cost: 0,
+          distance: 0
+        };
+        const heap = [startRecord];
+        const bestCost = new Map([[trafficStateKey(startRecord.nodeId, startRecord.previousNode), 0]]);
+        let iterations = 0;
+
+        while (heap.length && iterations < maxIterations) {
+          iterations += 1;
+          const record = popTrafficHeap(heap);
+          const recordKey = trafficStateKey(record.nodeId, record.previousNode);
+          if (record.cost > (bestCost.get(recordKey) || Infinity) + 0.001) {
+            continue;
+          }
+          if (targetNodes.has(record.nodeId) && record.distance >= minTravelDistance) {
+            return reconstructTrafficPath(record);
+          }
+
+          const outgoing = graph.adjacency.get(record.nodeId) || [];
+          outgoing.forEach((edge) => {
+            if (edge.to === record.previousNode || (edge.synthetic && edge.length > 4.2)) {
+              return;
+            }
+            const alignment = vectorAlignment(record.previousVector, edge.vector);
+            if (alignment <= -0.82) {
+              return;
+            }
+            const nextDistance = record.distance + edge.length;
+            if (nextDistance > maxTravelDistance) {
+              return;
+            }
+            const recentPenalty = vehicle.recentNodes.includes(edge.to) ? 90 : 0;
+            const nextCost = record.cost + trafficEdgeCost(edge, record.previousEdge, alignment) + recentPenalty;
+            const nextKey = trafficStateKey(edge.to, record.nodeId);
+            if (nextCost >= (bestCost.get(nextKey) || Infinity)) {
+              return;
+            }
+            const nextRecord = {
+              nodeId: edge.to,
+              previousNode: record.nodeId,
+              previousVector: edge.vector,
+              previousEdge: edge,
+              edge,
+              parent: record,
+              cost: nextCost,
+              distance: nextDistance
+            };
+            bestCost.set(nextKey, nextCost);
+            pushTrafficHeap(heap, nextRecord);
+          });
+        }
+
+        return [];
+      }
+
+      function trafficStateKey(nodeId, previousNodeId) {
+        return `${nodeId}|${previousNodeId}`;
+      }
+
+      function trafficEdgeCost(edge, previousEdge, alignment) {
+        let cost = edge.length / Math.max(0.8, roadPreference(edge) * 0.42);
+        if (alignment < -0.1) {
+          cost += 58;
+        } else if (alignment < 0.35) {
+          cost += 26;
+        } else if (alignment < 0.72) {
+          cost += 8;
+        } else {
+          cost -= 3;
+        }
+        if (previousEdge && edge.roadId === previousEdge.roadId && alignment > 0.35) {
+          cost *= 0.72;
+        }
+        if (edge.rank >= 7) {
+          cost *= 0.78;
+        } else if (edge.rank <= 3) {
+          cost *= 1.42;
+        }
+        if (edge.synthetic) {
+          cost += 120;
+        }
+        return Math.max(1, cost);
+      }
+
+      function reconstructTrafficPath(record) {
+        const path = [];
+        let cursor = record;
+        while (cursor && cursor.edge) {
+          path.push(cursor.edge);
+          cursor = cursor.parent;
+        }
+        return path.reverse();
+      }
+
+      function pushTrafficHeap(heap, record) {
+        heap.push(record);
+        let index = heap.length - 1;
+        while (index > 0) {
+          const parentIndex = Math.floor((index - 1) / 2);
+          if (heap[parentIndex].cost <= record.cost) {
+            break;
+          }
+          heap[index] = heap[parentIndex];
+          index = parentIndex;
+        }
+        heap[index] = record;
+      }
+
+      function popTrafficHeap(heap) {
+        const first = heap[0];
+        const last = heap.pop();
+        if (heap.length && last) {
+          let index = 0;
+          while (true) {
+            const leftIndex = index * 2 + 1;
+            const rightIndex = leftIndex + 1;
+            if (leftIndex >= heap.length) {
+              break;
+            }
+            const smallerIndex = rightIndex < heap.length && heap[rightIndex].cost < heap[leftIndex].cost
+              ? rightIndex
+              : leftIndex;
+            if (heap[smallerIndex].cost >= last.cost) {
+              break;
+            }
+            heap[index] = heap[smallerIndex];
+            index = smallerIndex;
+          }
+          heap[index] = last;
+        }
+        return first;
+      }
+
+      function filterDeadEndCandidates(graph, candidates) {
+        return candidates.filter((edge) => hasForwardPathAfterEdge(graph, edge));
+      }
+
+      function preferRealTrafficEdges(candidates) {
+        const realEdges = candidates.filter((edge) => !edge.synthetic);
+        return realEdges.length ? realEdges : candidates;
+      }
+
+      function hasForwardPathAfterEdge(graph, edge) {
+        const targetDistance = edge.rank <= 3 ? 46 : 72;
+        const stack = [{
+          nodeId: edge.to,
+          previousNode: edge.from,
+          previousVector: edge.vector,
+          distance: 0,
+          depth: 0,
+          visited: new Set([edge.id])
+        }];
+
+        while (stack.length) {
+          const state = stack.pop();
+          const exits = (graph.adjacency.get(state.nodeId) || [])
+            .filter((nextEdge) => nextEdge.to !== state.previousNode
+              && !state.visited.has(nextEdge.id)
+              && vectorAlignment(state.previousVector, nextEdge.vector) > -0.82);
+
+          for (const nextEdge of exits) {
+            if (nextEdge.synthetic && nextEdge.length > 4.2) {
+              continue;
+            }
+            const nextDistance = state.distance + nextEdge.length;
+            const nextDepth = state.depth + 1;
+            if (nextDistance >= targetDistance) {
+              return true;
+            }
+            if (nextDepth >= 8) {
+              continue;
+            }
+            const visited = new Set(state.visited);
+            visited.add(nextEdge.id);
+            stack.push({
+              nodeId: nextEdge.to,
+              previousNode: nextEdge.from,
+              previousVector: nextEdge.vector,
+              distance: nextDistance,
+              depth: nextDepth,
+              visited
+            });
+          }
+        }
+
+        return false;
+      }
+
+      function hasImmediateForwardExit(graph, edge) {
+        return (graph.adjacency.get(edge.to) || [])
+          .some((nextEdge) => nextEdge.to !== edge.from
+            && vectorAlignment(edge.vector, nextEdge.vector) > -0.82
+            && (!nextEdge.synthetic || nextEdge.length <= 4.2));
+      }
+
+      function rankTransitionPreference(incomingEdge, nextEdge, alignment) {
+        const rankDelta = nextEdge.rank - incomingEdge.rank;
+        let weight = 1;
+
+        if (incomingEdge.rank >= 7) {
+          if (nextEdge.rank >= incomingEdge.rank - 1 && alignment > 0.25) {
+            weight *= 3.4;
+          } else if (nextEdge.rank <= 3) {
+            weight *= 0.1;
+          } else if (rankDelta <= -3) {
+            weight *= 0.28;
+          } else if (rankDelta < 0) {
+            weight *= 0.62;
+          }
+        } else if (incomingEdge.rank >= 5) {
+          if (nextEdge.rank >= incomingEdge.rank && alignment > 0.25) {
+            weight *= 2.2;
+          } else if (nextEdge.rank <= 3) {
+            weight *= 0.34;
+          } else if (rankDelta < 0) {
+            weight *= 0.72;
+          }
+        } else if (incomingEdge.rank <= 3) {
+          if (nextEdge.rank >= 6) {
+            weight *= 5.2;
+          } else if (nextEdge.rank >= 4) {
+            weight *= 2.8;
+          } else if (nextEdge.rank <= 3) {
+            weight *= alignment > 0.55 ? 0.78 : 0.46;
+          }
+        }
+
+        if (nextEdge.highway.includes("link")) {
+          weight *= incomingEdge.rank >= 6 ? 0.62 : 1.45;
+        }
+        return weight;
+      }
+
+      function rememberVehiclePath(vehicle, edge) {
+        vehicle.recentEdges.push(edge.id);
+        if (vehicle.recentEdges.length > 12) {
+          vehicle.recentEdges.shift();
+        }
+        vehicle.recentNodes.push(edge.to);
+        if (vehicle.recentNodes.length > 14) {
+          vehicle.recentNodes.shift();
+        }
+      }
+
+      function maybeStopAtIntersection(vehicle, nodeId, incomingEdge, nextEdge, alignment, timestamp) {
+        const degree = (routeLibrary.graph.adjacency.get(nodeId) || []).length;
+        if (degree < 3 || timestamp < vehicle.stopUntil || isElevatedOrExpressway(nextEdge)) {
+          return;
+        }
+        if (isFreeFlowStraight(incomingEdge, nextEdge, alignment)) {
+          vehicle.stopUntil = 0;
+          return;
+        }
+        let stopChance = 0.045 + Math.min(0.12, Math.max(0, degree - 3) * 0.014);
+        if (incomingEdge.rank <= 3 || nextEdge.rank <= 3) {
+          stopChance += 0.045;
+        }
+        if (alignment < 0.45) {
+          stopChance += 0.04;
+        }
+        if (incomingEdge.rank >= 7 && nextEdge.rank >= 7) {
+          stopChance *= 0.35;
+        }
+        if (rng() < stopChance) {
+          vehicle.stopUntil = timestamp + 260 + rng() * 1180;
+        }
+      }
+
+      function isFreeFlowStraight(incomingEdge, nextEdge, alignment) {
+        return isElevatedOrExpressway(incomingEdge)
+          && isElevatedOrExpressway(nextEdge)
+          && alignment > 0.55;
+      }
+
+      function isElevatedOrExpressway(edge) {
+        return edge.rank >= 8 || edge.highway === "motorway" || edge.highway === "trunk";
+      }
+
+      function updateTurnSlowdown(vehicle, alignment, timestamp) {
+        if (alignment >= 0.86) {
+          if (timestamp - vehicle.lastTurnTime > 1800) {
+            vehicle.consecutiveTurns = 0;
+          }
+          return;
+        }
+
+        if (timestamp - vehicle.lastTurnTime < 2200) {
+          vehicle.consecutiveTurns = Math.min(4, vehicle.consecutiveTurns + 1);
+        } else {
+          vehicle.consecutiveTurns = 1;
+        }
+        vehicle.lastTurnTime = timestamp;
+
+        let baseFactor = 0.82;
+        if (alignment < 0.2) {
+          baseFactor = 0.65;
+        } else if (alignment < 0.55) {
+          baseFactor = 0.78;
+        } else {
+          baseFactor = 0.9;
+        }
+        const continuousPenalty = (vehicle.consecutiveTurns - 1) * 0.06;
+        vehicle.turnSlowFactor = Math.max(0.55, baseFactor - continuousPenalty);
+        vehicle.turnSlowdownUntil = Math.max(
+          vehicle.turnSlowdownUntil,
+          timestamp + 360 + vehicle.consecutiveTurns * 220 + rng() * 180
+        );
+      }
+
+      function maybeStartTrafficSlowdown(vehicle, timestamp) {
+        if (timestamp < vehicle.nextIncidentCheck) {
+          return;
+        }
+        vehicle.nextIncidentCheck = timestamp + 2200 + rng() * 5200;
+        if (timestamp < vehicle.slowUntil) {
+          return;
+        }
+        const edge = vehicle.currentEdge;
+        let chance = 0.025;
+        if (edge.rank <= 3) {
+          chance += 0.02;
+        } else if (edge.rank >= 7) {
+          chance *= 0.6;
+        }
+        if (rng() < chance) {
+          vehicle.slowUntil = timestamp + 2200 + rng() * 5600;
+          vehicle.slowFactor = 0.18 + rng() * 0.38;
+        } else {
+          vehicle.slowFactor = 1;
+        }
+      }
+
+      function getVehicleCruiseSpeed(edge, personality) {
+        const speeds = {
+          motorway: 152,
+          trunk: 132,
+          primary: 112,
+          motorway_link: 92,
+          trunk_link: 88,
+          primary_link: 82,
+          secondary: 88,
+          secondary_link: 74,
+          tertiary: 72,
+          tertiary_link: 62,
+          unclassified: 58,
+          residential: 46
+        };
+        return (speeds[edge.highway] || 54) * personality;
+      }
+
+      function roadPreference(edge) {
+        const weights = {
+          motorway: 8.2,
+          trunk: 6.8,
+          primary: 5.3,
+          motorway_link: 4.2,
+          trunk_link: 4,
+          primary_link: 3.6,
+          secondary: 3.8,
+          secondary_link: 2.9,
+          tertiary: 2.5,
+          tertiary_link: 2.1,
+          unclassified: 1.55,
+          residential: 1
+        };
+        return weights[edge.highway] || Math.max(0.8, edge.rank * 0.48);
+      }
+
+      function weightedChoice(weightedItems) {
+        const total = weightedItems.reduce((sum, entry) => sum + entry.weight, 0);
+        let cursor = rng() * total;
+        for (const entry of weightedItems) {
+          cursor -= entry.weight;
+          if (cursor <= 0) {
+            return entry.item;
+          }
+        }
+        return weightedItems[weightedItems.length - 1].item;
+      }
+
+      function sampleEdge(edge, progress) {
+        const ratio = Math.max(0, Math.min(1, progress / (edge.length || 1)));
+        const start = edge.points[0];
+        const end = edge.points[1];
+        return {
+          x: lerp(start[0], end[0], ratio),
+          y: lerp(start[1], end[1], ratio)
+        };
       }
 
       function generateCityBlocks() {
@@ -1224,9 +1978,8 @@
         });
 
         vehicles.forEach((vehicle, index) => {
-          vehicle.progress = (vehicle.progress + vehicle.speed * dt) % vehicle.route.totalLength;
-          const position = sampleRoute(vehicle.route, vehicle.progress);
-          vehicle.position = position;
+          advanceVehicle(vehicle, dt, timestamp, index);
+          const position = vehicle.position;
           vehicle.trail.push({ x: position.x, y: position.y, life: 1 });
           if (vehicle.trail.length > 16) {
             vehicle.trail.shift();
@@ -1943,8 +2696,11 @@
       }
 
       function predictNextDistrict(vehicle, advanceBy) {
-        const futureProgress = (vehicle.progress + advanceBy) % vehicle.route.totalLength;
-        const point = sampleRoute(vehicle.route, futureProgress);
+        if (!vehicle.currentEdge) {
+          return vehicle.districtId;
+        }
+        const futureProgress = Math.min(vehicle.currentEdge.length, vehicle.edgeProgress + advanceBy);
+        const point = sampleEdge(vehicle.currentEdge, futureProgress);
         const district = getDistrictByPoint(point.x, point.y);
         return district ? district.id : vehicle.districtId;
       }
@@ -1967,41 +2723,6 @@
           }
         });
         return min;
-      }
-
-      function createPolyline(points) {
-        const normalized = points.map((point) => Array.isArray(point) ? { x: point[0], y: point[1] } : { x: point.x, y: point.y });
-        const cumulative = [0];
-        for (let index = 1; index < normalized.length; index += 1) {
-          cumulative[index] = cumulative[index - 1] + distance(normalized[index - 1], normalized[index]);
-        }
-        return { points: normalized, cumulative, totalLength: cumulative[cumulative.length - 1] || 1 };
-      }
-
-      function sampleRoute(route, progress) {
-        const distanceTarget = ((progress % route.totalLength) + route.totalLength) % route.totalLength;
-        for (let index = 0; index < route.cumulative.length - 1; index += 1) {
-          const startDistance = route.cumulative[index];
-          const endDistance = route.cumulative[index + 1];
-          if (distanceTarget <= endDistance) {
-            const span = endDistance - startDistance || 1;
-            const ratio = (distanceTarget - startDistance) / span;
-            return {
-              x: lerp(route.points[index].x, route.points[index + 1].x, ratio),
-              y: lerp(route.points[index].y, route.points[index + 1].y, ratio)
-            };
-          }
-        }
-        const last = route.points[route.points.length - 1];
-        return { x: last.x, y: last.y };
-      }
-
-      function createConnector(start, end) {
-        const startPoint = toPoint(start);
-        const endPoint = toPoint(end);
-        const midX = lerp(startPoint.x, endPoint.x, 0.5) + (rng() - 0.5) * 28;
-        const midY = lerp(startPoint.y, endPoint.y, 0.5) + (rng() - 0.5) * 28;
-        return [{ x: midX, y: midY }, { x: endPoint.x, y: endPoint.y }];
       }
 
       function drawBeam(context, start, end, color, progress, alpha) {
