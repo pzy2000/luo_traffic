@@ -783,11 +783,13 @@
           const outgoingCounts = Array.from(routeLibrary.graph.adjacency.values()).map((edges) => edges.length);
           const activeSpeeds = vehicles.map((vehicle) => vehicle.speed);
           return {
-            mode: "intersection-random-walk",
+            mode: "planned-network-routing",
             graphRoadCount: routeLibrary.graph.routeRoadCount,
             graphSegmentCount: routeLibrary.graph.edgeCount,
             graphConnectorCount: routeLibrary.graph.connectorCount,
             graphPrunedNodeCount: routeLibrary.graph.prunedNodeCount,
+            graphComponentCount: routeLibrary.graph.componentCount,
+            graphLargestComponentNodeCount: routeLibrary.graph.largestComponentNodeCount,
             graphNodeCount: routeLibrary.graph.nodes.size,
             seedNodeCount: routeLibrary.seedNodes.length,
             targetNodeCount: routeLibrary.targetNodes.length,
@@ -982,6 +984,7 @@
         });
 
         const connectorCount = addNearbyTrafficConnectors(nodes, adjacency);
+        const componentStats = annotateTrafficComponents(nodes, adjacency);
         const prunedNodeCount = 0;
         return {
           nodes,
@@ -989,6 +992,8 @@
           edgeCount,
           connectorCount,
           prunedNodeCount,
+          componentCount: componentStats.count,
+          largestComponentNodeCount: componentStats.largestNodeCount,
           routeRoadCount: routeRoads.length
         };
       }
@@ -1086,6 +1091,50 @@
         return (adjacency.get(from) || []).some((edge) => edge.to === to);
       }
 
+      function annotateTrafficComponents(nodes, adjacency) {
+        let componentId = 0;
+        let largestNodeCount = 0;
+
+        nodes.forEach((node, nodeId) => {
+          if (node.componentId !== undefined) {
+            return;
+          }
+          const queue = [nodeId];
+          const componentNodes = [];
+          let queueIndex = 0;
+          node.componentId = componentId;
+
+          while (queueIndex < queue.length) {
+            const currentId = queue[queueIndex];
+            queueIndex += 1;
+            const current = nodes.get(currentId);
+            if (!current) {
+              continue;
+            }
+            componentNodes.push(currentId);
+            (adjacency.get(currentId) || []).forEach((edge) => {
+              const nextNode = nodes.get(edge.to);
+              if (!nextNode || nextNode.componentId !== undefined) {
+                return;
+              }
+              nextNode.componentId = componentId;
+              queue.push(edge.to);
+            });
+          }
+
+          largestNodeCount = Math.max(largestNodeCount, componentNodes.length);
+          componentNodes.forEach((currentId) => {
+            const current = nodes.get(currentId);
+            if (current) {
+              current.componentSize = componentNodes.length;
+            }
+          });
+          componentId += 1;
+        });
+
+        return { count: componentId, largestNodeCount };
+      }
+
       function pruneDeadEndTrafficGraph(nodes, adjacency) {
         const neighbors = new Map();
         nodes.forEach((node, nodeId) => {
@@ -1154,6 +1203,20 @@
         return order.indexOf(first) >= order.indexOf(second) ? first : second;
       }
 
+      function trafficComponentThreshold(graph) {
+        return Math.max(24, Math.floor((graph.largestComponentNodeCount || graph.nodes.size) * 0.035));
+      }
+
+      function isUsableTrafficNode(graph, nodeId) {
+        const node = graph.nodes.get(nodeId);
+        return Boolean(node && (node.componentSize || 0) >= trafficComponentThreshold(graph));
+      }
+
+      function filterUsableTrafficNodes(graph, nodeIds) {
+        const usableNodes = nodeIds.filter((nodeId) => isUsableTrafficNode(graph, nodeId));
+        return usableNodes.length ? usableNodes : nodeIds;
+      }
+
       function collectRouteSeedNodes(graph) {
         const seeds = [];
         routeTemplates.forEach((segments) => {
@@ -1194,13 +1257,13 @@
         if (!seeds.length) {
           seeds.push(...graph.nodes.keys());
         }
-        return seeds;
+        return filterUsableTrafficNodes(graph, seeds);
       }
 
       function collectRouteTargetNodes(graph, seedNodes) {
         const targets = [];
         graph.adjacency.forEach((edges, nodeId) => {
-          if (!graph.nodes.has(nodeId)) {
+          if (!graph.nodes.has(nodeId) || !isUsableTrafficNode(graph, nodeId)) {
             return;
           }
           const realEdges = edges.filter((edge) => !edge.synthetic);
@@ -1211,6 +1274,9 @@
           }
         });
         seedNodes.forEach((nodeId) => {
+          if (!isUsableTrafficNode(graph, nodeId)) {
+            return;
+          }
           const edges = graph.adjacency.get(nodeId) || [];
           const realEdges = edges.filter((edge) => !edge.synthetic);
           if (realEdges.length >= 3 && !targets.includes(nodeId)) {
@@ -1220,7 +1286,7 @@
         if (targets.length) {
           return targets;
         }
-        return [...graph.nodes.keys()];
+        return filterUsableTrafficNodes(graph, [...graph.nodes.keys()]);
       }
 
       function findClosestGraphNode(graph, point) {
@@ -1288,10 +1354,15 @@
       }
 
       function chooseInitialTrafficEdge(graph, seedNode, salt) {
-        let candidates = preferRealTrafficEdges(graph.adjacency.get(seedNode) || []);
+        const initialEdges = graph.adjacency.get(seedNode) || [];
+        let candidates = preferRealTrafficEdges(filterDeadEndCandidates(graph, initialEdges));
         if (!candidates.length) {
-          const fallback = Array.from(graph.adjacency.entries()).find((entry) => entry[1].length);
-          candidates = fallback ? preferRealTrafficEdges(fallback[1]) : [];
+          candidates = preferRealTrafficEdges(initialEdges);
+        }
+        if (!candidates.length) {
+          const fallback = Array.from(graph.adjacency.entries())
+            .find((entry) => isUsableTrafficNode(graph, entry[0]) && filterDeadEndCandidates(graph, entry[1]).length);
+          candidates = fallback ? preferRealTrafficEdges(filterDeadEndCandidates(graph, fallback[1])) : [];
         }
         if (!candidates.length) {
           return null;
@@ -1367,6 +1438,19 @@
         }
 
         const previousNode = incomingEdge.from;
+        const plannedEdge = takePlannedTrafficEdge(graph, nodeId, vehicle, incomingEdge);
+        if (plannedEdge) {
+          return plannedEdge;
+        }
+
+        const plannedRoute = planTrafficRoute(graph, nodeId, vehicle, incomingEdge, salt);
+        if (plannedRoute.length) {
+          vehicle.plannedEdges = plannedRoute;
+          const routedEdge = takePlannedTrafficEdge(graph, nodeId, vehicle, incomingEdge);
+          if (routedEdge) {
+            return routedEdge;
+          }
+        }
         vehicle.plannedEdges = [];
 
         let candidates = outgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.18);
@@ -1384,6 +1468,10 @@
         }
         if (!candidates.length) {
           candidates = outgoing;
+        }
+        const forwardCandidates = filterDeadEndCandidates(graph, candidates);
+        if (forwardCandidates.length) {
+          candidates = forwardCandidates;
         }
         candidates = preferRealTrafficEdges(candidates);
 
@@ -1403,10 +1491,10 @@
             weight *= incomingEdge.rank >= 6 ? 2.8 : 1.6;
           }
           if (vehicle.recentEdges.includes(edge.id)) {
-            weight *= 0.12;
+            weight *= 0.035;
           }
           if (vehicle.recentNodes.includes(edge.to)) {
-            weight *= 0.2;
+            weight *= 0.08;
           }
           if (edge.synthetic) {
             weight *= 0.16;
@@ -1505,9 +1593,22 @@
         if (!startNode) {
           return [];
         }
-        const pool = routeLibrary.targetNodes.length ? routeLibrary.targetNodes : [...graph.nodes.keys()];
+        const routeTargets = routeLibrary.targetNodes.length ? routeLibrary.targetNodes : [...graph.nodes.keys()];
+        const sameComponentTargets = routeTargets.filter((targetId) => {
+          const targetNode = graph.nodes.get(targetId);
+          return targetNode && targetNode.componentId === startNode.componentId;
+        });
+        const sameComponentFallback = [...graph.nodes.keys()].filter((targetId) => {
+          const targetNode = graph.nodes.get(targetId);
+          return targetNode && targetNode.componentId === startNode.componentId;
+        });
+        const pool = sameComponentTargets.length ? sameComponentTargets : sameComponentFallback;
+        if (!pool.length) {
+          return [];
+        }
         const targets = [];
-        const attempts = Math.min(pool.length, 42);
+        const attempts = Math.min(pool.length, 60);
+        const minTargetDistance = (startNode.componentSize || 0) < 160 ? 110 : 220;
         for (let attempt = 0; attempt < attempts && targets.length < 10; attempt += 1) {
           const index = (salt * 37 + attempt * 53 + Math.floor(rng() * pool.length)) % pool.length;
           const targetId = pool[index];
@@ -1515,7 +1616,7 @@
           if (!targetNode || targetId === nodeId || targets.includes(targetId) || vehicle.recentNodes.includes(targetId)) {
             continue;
           }
-          if (distance(startNode, targetNode) < 220 && attempt < attempts - 8) {
+          if (distance(startNode, targetNode) < minTargetDistance && attempt < attempts - 8) {
             continue;
           }
           targets.push(targetId);
@@ -1769,11 +1870,11 @@
 
       function rememberVehiclePath(vehicle, edge) {
         vehicle.recentEdges.push(edge.id);
-        if (vehicle.recentEdges.length > 12) {
+        if (vehicle.recentEdges.length > 24) {
           vehicle.recentEdges.shift();
         }
         vehicle.recentNodes.push(edge.to);
-        if (vehicle.recentNodes.length > 14) {
+        if (vehicle.recentNodes.length > 30) {
           vehicle.recentNodes.shift();
         }
       }
