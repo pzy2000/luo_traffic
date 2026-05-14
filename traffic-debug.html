@@ -61,6 +61,9 @@
       </select>
       <label class="toggle"><input id="showConnectors" type="checkbox" checked />短连接</label>
       <label class="toggle"><input id="showDeadEnds" type="checkbox" checked />死路点</label>
+      <label class="toggle"><input id="showRouteGraph" type="checkbox" checked />路由图</label>
+      <label class="toggle"><input id="showExcludedRoads" type="checkbox" />未入图道路</label>
+      <label class="toggle"><input id="showNearMisses" type="checkbox" checked />错位端点</label>
       <label class="toggle"><input id="showSmallComponents" type="checkbox" checked />小片区</label>
       <label class="toggle"><input id="showTrails" type="checkbox" checked />轨迹</label>
       <label class="toggle"><input id="showPlans" type="checkbox" checked />规划线</label>
@@ -75,8 +78,11 @@
     <h2>图例</h2>
     <div class="legend">
       <div><span class="key" style="background:#202734"></span>真实道路</div>
+      <div><span class="key" style="background:#00a6a6"></span>路由图边</div>
+      <div><span class="key" style="background:#7c3aed"></span>未入图道路</div>
       <div><span class="key" style="background:#f28c28"></span>短连接</div>
       <div><span class="dot" style="background:#f04444"></span>死路节点</div>
+      <div><span class="dot" style="background:#0ea5e9"></span>未入图端点</div>
       <div><span class="dot" style="background:#6b5cff"></span>小连通片区</div>
       <div><span class="dot" style="background:#1e9b55"></span>按规划行驶</div>
       <div><span class="dot" style="background:#e03b3b"></span>疑似小范围循环</div>
@@ -113,6 +119,9 @@
       speedSelect: document.getElementById("speedSelect"),
       showConnectors: document.getElementById("showConnectors"),
       showDeadEnds: document.getElementById("showDeadEnds"),
+      showRouteGraph: document.getElementById("showRouteGraph"),
+      showExcludedRoads: document.getElementById("showExcludedRoads"),
+      showNearMisses: document.getElementById("showNearMisses"),
       showSmallComponents: document.getElementById("showSmallComponents"),
       showTrails: document.getElementById("showTrails"),
       showPlans: document.getElementById("showPlans"),
@@ -306,6 +315,9 @@
       if (!appData || !routeLibrary) return;
       drawDistricts();
       drawRoads();
+      if (controls.showExcludedRoads.checked) drawExcludedRoads();
+      if (controls.showRouteGraph.checked) drawRouteGraph();
+      if (controls.showNearMisses.checked) drawNearMisses();
       if (controls.showSmallComponents.checked) drawSmallComponents();
       if (controls.showDeadEnds.checked) drawDeadEnds();
       if (controls.showConnectors.checked) drawConnectors();
@@ -349,6 +361,66 @@
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
         ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    function drawExcludedRoads() {
+      ctx.save();
+      appData.roads.forEach((road) => {
+        if (!isDrawnRoad(road) || isRouteRoad(road)) return;
+        ctx.beginPath();
+        road.points.forEach((point, index) => {
+          const p = worldToScreen(point[0], point[1]);
+          if (index === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        });
+        ctx.lineWidth = Math.max(1, 1.6 * Math.sqrt(view.scale));
+        ctx.strokeStyle = "#7c3aed";
+        ctx.globalAlpha = 0.64;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    function drawRouteGraph() {
+      ctx.save();
+      routeLibrary.allEdges.forEach((edge) => {
+        if (edge.synthetic || !edge.id.endsWith(":f")) return;
+        const start = worldToScreen(edge.points[0][0], edge.points[0][1]);
+        const end = worldToScreen(edge.points[1][0], edge.points[1][1]);
+        ctx.beginPath();
+        ctx.moveTo(start.x, start.y);
+        ctx.lineTo(end.x, end.y);
+        ctx.lineWidth = Math.max(0.9, (edge.rank >= 6 ? 1.9 : 1.2) * Math.sqrt(view.scale));
+        ctx.strokeStyle = edge.rank >= 6 ? "#008080" : "#00a6a6";
+        ctx.globalAlpha = edge.rank >= 6 ? 0.82 : 0.58;
+        ctx.lineCap = "round";
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    function drawNearMisses() {
+      const diagnostics = routeLibrary.graph.diagnostics;
+      ctx.save();
+      diagnostics.deadEndsNearVisualRoad.forEach((item) => {
+        const p = worldToScreen(item.x, item.y);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, Math.max(5, 6 * Math.sqrt(view.scale)), 0, Math.PI * 2);
+        ctx.strokeStyle = "#fb923c";
+        ctx.lineWidth = Math.max(1.4, 1.6 * Math.sqrt(view.scale));
+        ctx.globalAlpha = 0.88;
+        ctx.stroke();
+      });
+      diagnostics.excludedVisualEndpoints.forEach((item) => {
+        const p = worldToScreen(item.x, item.y);
+        const size = Math.max(3, 4 * Math.sqrt(view.scale));
+        ctx.fillStyle = "#0ea5e9";
+        ctx.globalAlpha = 0.7;
+        ctx.fillRect(p.x - size / 2, p.y - size / 2, size, size);
       });
       ctx.restore();
     }
@@ -494,6 +566,8 @@
         statHtml(graph.componentCount, "连通片区"),
         statHtml(graph.connectorCount, "短连接"),
         statHtml(deadEnds, "死路节点"),
+        statHtml(graph.diagnostics.deadEndsNearVisualRoad.length, "贴近底图死路"),
+        statHtml(graph.diagnostics.excludedVisualEndpoints.length, "未入图端点"),
         statHtml(loops, "疑似循环"),
         statHtml(local, "当前局部兜底"),
         statHtml(issueCounts.uturn, "掉头/急回头"),
@@ -582,7 +656,7 @@
       function ensureNode(point) {
         const key = nodeKey(point);
         if (!nodes.has(key)) {
-          nodes.set(key, { id: key, x: point[0], y: point[1] });
+          nodes.set(key, { id: key, x: point[0], y: point[1], roads: new Set() });
           adjacency.set(key, []);
         }
         return key;
@@ -595,6 +669,8 @@
           if (length < 3) continue;
           const from = ensureNode(start);
           const to = ensureNode(end);
+          nodes.get(from).roads.add(road.id);
+          nodes.get(to).roads.add(road.id);
           const edgeId = road.id + ":" + index;
           const forward = createTrafficEdge(edgeId + ":f", road, from, to, start, end, length);
           const backward = createTrafficEdge(edgeId + ":b", road, to, from, end, start, length);
@@ -606,7 +682,8 @@
       });
       const connectorCount = addNearbyTrafficConnectors(nodes, adjacency, allEdges);
       const componentStats = annotateTrafficComponents(nodes, adjacency);
-      return { nodes, adjacency, allEdges, edgeCount, connectorCount, componentCount: componentStats.count, largestComponentNodeCount: componentStats.largestNodeCount, routeRoadCount: routeRoads.length };
+      const diagnostics = buildGraphDiagnostics(nodes, adjacency);
+      return { nodes, adjacency, allEdges, diagnostics, edgeCount, connectorCount, componentCount: componentStats.count, largestComponentNodeCount: componentStats.largestNodeCount, routeRoadCount: routeRoads.length };
     }
 
     function createTrafficEdge(edgeId, road, from, to, start, end, length) {
@@ -694,6 +771,120 @@
         componentId += 1;
       });
       return { count: componentId, largestNodeCount };
+    }
+
+    function buildGraphDiagnostics(nodes, adjacency) {
+      const drawnRoads = appData.roads.filter(isDrawnRoad);
+      const graphNodes = [...nodes.values()];
+      const segmentBuckets = buildRoadSegmentBuckets(drawnRoads, 18);
+      const nodeBuckets = buildNodeBuckets(graphNodes, 4);
+      const deadEndsNearVisualRoad = [];
+      const excludedVisualEndpoints = [];
+
+      graphNodes.forEach((node) => {
+        const degree = (adjacency.get(node.id) || []).length;
+        if (degree > 1) return;
+        const nearest = findNearestNonIncidentRoad(node, segmentBuckets, 18);
+        if (nearest && nearest.distance <= 2) {
+          deadEndsNearVisualRoad.push({
+            x: node.x,
+            y: node.y,
+            nodeId: node.id,
+            componentSize: node.componentSize,
+            roadName: nearest.road.name || nearest.road.id,
+            distance: nearest.distance
+          });
+        }
+      });
+
+      drawnRoads.forEach((road) => {
+        if (isRouteRoad(road)) return;
+        [road.points[0], road.points[road.points.length - 1]].forEach((point) => {
+          if (hasNearbyGraphNode(nodeBuckets, point, 1.6, 4)) return;
+          excludedVisualEndpoints.push({
+            x: point[0],
+            y: point[1],
+            roadId: road.id,
+            roadName: road.name || road.id,
+            highway: road.highway,
+            length: road.length
+          });
+        });
+      });
+
+      return { deadEndsNearVisualRoad, excludedVisualEndpoints };
+    }
+
+    function buildRoadSegmentBuckets(roads, cellSize) {
+      const buckets = new Map();
+      roads.forEach((road) => {
+        for (let index = 0; index < road.points.length - 1; index += 1) {
+          const start = road.points[index];
+          const end = road.points[index + 1];
+          const minX = Math.floor(Math.min(start[0], end[0]) / cellSize);
+          const maxX = Math.floor(Math.max(start[0], end[0]) / cellSize);
+          const minY = Math.floor(Math.min(start[1], end[1]) / cellSize);
+          const maxY = Math.floor(Math.max(start[1], end[1]) / cellSize);
+          const segment = { road, start, end };
+          for (let x = minX; x <= maxX; x += 1) {
+            for (let y = minY; y <= maxY; y += 1) {
+              const key = x + ":" + y;
+              if (!buckets.has(key)) buckets.set(key, []);
+              buckets.get(key).push(segment);
+            }
+          }
+        }
+      });
+      return buckets;
+    }
+
+    function buildNodeBuckets(nodes, cellSize) {
+      const buckets = new Map();
+      nodes.forEach((node) => {
+        const key = Math.floor(node.x / cellSize) + ":" + Math.floor(node.y / cellSize);
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(node);
+      });
+      return buckets;
+    }
+
+    function findNearestNonIncidentRoad(node, segmentBuckets, cellSize) {
+      let best = null;
+      const cellX = Math.floor(node.x / cellSize);
+      const cellY = Math.floor(node.y / cellSize);
+      for (let dx = -1; dx <= 1; dx += 1) {
+        for (let dy = -1; dy <= 1; dy += 1) {
+          const segments = segmentBuckets.get((cellX + dx) + ":" + (cellY + dy)) || [];
+          segments.forEach((segment) => {
+            if (node.roads && node.roads.has(segment.road.id)) return;
+            const value = pointToSegmentDistance(node, segment.start, segment.end);
+          if (!best || value < best.distance) {
+              best = { distance: value, road: segment.road };
+          }
+          });
+        }
+      }
+      return best;
+    }
+
+    function hasNearbyGraphNode(nodeBuckets, point, threshold, cellSize) {
+      const cellX = Math.floor(point[0] / cellSize);
+      const cellY = Math.floor(point[1] / cellSize);
+      for (let dx = -1; dx <= 1; dx += 1) {
+        for (let dy = -1; dy <= 1; dy += 1) {
+          const nodes = nodeBuckets.get((cellX + dx) + ":" + (cellY + dy)) || [];
+          if (nodes.some((node) => distance(point, node) <= threshold)) return true;
+        }
+      }
+      return false;
+    }
+
+    function isDrawnRoad(road) {
+      return road.rank >= 2 && road.points.length > 1;
+    }
+
+    function isRouteRoad(road) {
+      return road.rank >= 2 && road.length >= 8 && road.points.length > 1;
     }
 
     function hasTrafficConnection(adjacency, from, to) {
@@ -1305,6 +1496,17 @@
       const bx = Array.isArray(b) ? b[0] : b.x;
       const by = Array.isArray(b) ? b[1] : b.y;
       return Math.hypot(ax - bx, ay - by);
+    }
+
+    function pointToSegmentDistance(point, start, end) {
+      const lengthSq = (end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2;
+      if (!lengthSq) return distance(point, start);
+      const t = clamp(
+        ((point.x - start[0]) * (end[0] - start[0]) + (point.y - start[1]) * (end[1] - start[1])) / lengthSq,
+        0,
+        1
+      );
+      return Math.hypot(point.x - lerp(start[0], end[0], t), point.y - lerp(start[1], end[1], t));
     }
 
     function lerp(start, end, factor) {
