@@ -63,6 +63,12 @@ const ROAD_TAGS_TO_KEEP = [
 ];
 
 const CONTROL_ROADS = ["外环", "嘉闵", "沪闵", "七莘", "虹梅", "莲花", "顾戴", "吴中", "申长"];
+const JIAMIN_NAME_PATTERN = /嘉闵/;
+const SUPPLEMENTAL_BBOX_MARGIN_DEGREES = 0.018;
+const SUPPLEMENTAL_NORTH_MARGIN_DEGREES = 0;
+const SUPPLEMENTAL_NORTH_TRIM_DEGREES = 0.032;
+const JIAMIN_CORRIDOR_BUFFER_DEGREES = 0.0062;
+const JIAMIN_MAINLINE_BUFFER_DEGREES = 0.012;
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -120,7 +126,7 @@ async function main() {
   const routeGraph = serializeGraph(graph, {
     mode: graphMode,
     minRank,
-    source: "Strict OSM node-ref topology clipped to Minhang from Shanghai PBF",
+    source: "Strict OSM node-ref topology clipped to Minhang with bounded Jiamin corridor supplement from Shanghai PBF",
     pbf: path.basename(fileURLToPathname(pbfPath)),
     boundaryRelationId: RELATION_ID,
     routeRoads: roads.length,
@@ -130,7 +136,7 @@ async function main() {
 
   const nextMetadata = {
     ...metadata,
-    source: "Strict OSM node-ref topology from Shanghai PBF",
+    source: "Strict OSM node-ref topology from Shanghai PBF with bounded Jiamin corridor supplement",
     licence: "Data © OpenStreetMap contributors, ODbL 1.0",
     geofabrikUrl: null,
     osmTimestamp: raw.osmTimestamp || metadata.osmTimestamp,
@@ -145,10 +151,11 @@ async function main() {
     extraction: {
       tool: "tools/rebuild-minhang-topology.mjs",
       pbf: path.relative(process.cwd(), fileURLToPathname(pbfPath)),
-      clip: "relation polygon segment clipping",
+      clip: "relation polygon segment clipping plus Jiamin corridor supplement",
       topology: "OSM node refs only; no geometric snapping; no synthetic connectors",
       minOutputRank: minRank,
-      graphMode
+      graphMode,
+      supplementalCorridor: "Jiamin elevated road and nearby interchange roads outside Minhang relation; no north-side extension above Minhang bbox"
     },
     controlMatches: buildControlMatches(roads)
   };
@@ -297,17 +304,21 @@ function buildRoads(ways, nodes, bbox, bounds, boundaryRing) {
     edges: buildPolygonEdges(boundaryRing),
     bbox: bboxFromPoints(boundaryRing)
   };
+  const supplementalCorridor = buildJiaminSupplementalCorridor(ways, nodes, polygon.bbox);
 
   ways.forEach((way) => {
     const geometry = way.nodes.map((nodeId) => nodes.get(nodeId) || null);
     const wayBbox = bboxFromPoints(geometry.filter(Boolean));
-    if (!bboxOverlaps(wayBbox, polygon.bbox)) return;
-    const clippedParts = clipWayToPolygon(way, geometry, polygon);
     const tags = way.tags || {};
     const highway = tags.highway;
     const rank = HIGHWAY_RANK[highway] || 2;
+    const clippedParts = bboxOverlaps(wayBbox, polygon.bbox)
+      ? clipWayToPolygon(way, geometry, polygon)
+      : [];
+    const supplementalParts = clipWayToJiaminSupplement(way, geometry, polygon, supplementalCorridor, rank);
+    const allParts = clippedParts.concat(supplementalParts);
 
-    clippedParts.forEach((part, partIndex) => {
+    allParts.forEach((part, partIndex) => {
       if (part.points.length < 2) return;
       const projected = part.points.map((point) => projectPoint(point, bbox, bounds));
       const length = polylineLength(projected);
@@ -317,7 +328,7 @@ function buildRoads(ways, nodes, bbox, bounds, boundaryRing) {
         if (tags[key] !== undefined) keptTags[key] = tags[key];
       });
       roads.push({
-        id: clippedParts.length > 1 ? `${way.id}-${partIndex}` : String(way.id),
+        id: roadPartId(way.id, partIndex, allParts.length, part.supplemental),
         osmId: way.id,
         name: tags.name || "",
         highway,
@@ -333,12 +344,217 @@ function buildRoads(ways, nodes, bbox, bounds, boundaryRing) {
         access: tags.access || "",
         service: tags.service || "",
         routable: isRoutable(tags),
+        outsideMinhang: Boolean(part.supplemental),
+        supplemental: part.supplemental ? "jiamin-corridor" : "",
         tags: keptTags
       });
     });
   });
   roads.sort((a, b) => a.rank - b.rank || a.length - b.length || String(a.id).localeCompare(String(b.id)));
   return roads;
+}
+
+function roadPartId(wayId, partIndex, partCount, supplemental) {
+  if (supplemental) {
+    return `${wayId}-j${partIndex}`;
+  }
+  return partCount > 1 ? `${wayId}-${partIndex}` : String(wayId);
+}
+
+function buildJiaminSupplementalCorridor(ways, nodes, polygonBbox) {
+  const searchBbox = jiaminSupplementalBbox(polygonBbox, SUPPLEMENTAL_BBOX_MARGIN_DEGREES * 2);
+  const segments = [];
+  ways.forEach((way) => {
+    const tags = way.tags || {};
+    if (!JIAMIN_NAME_PATTERN.test(tags.name || "")) {
+      return;
+    }
+    const highway = tags.highway;
+    const rank = HIGHWAY_RANK[highway] || 2;
+    if (rank < 6) {
+      return;
+    }
+    const geometry = way.nodes.map((nodeId) => nodes.get(nodeId) || null);
+    const wayBbox = bboxFromPoints(geometry.filter(Boolean));
+    if (!bboxOverlaps(wayBbox, searchBbox)) {
+      return;
+    }
+    for (let index = 0; index < geometry.length - 1; index += 1) {
+      const start = geometry[index];
+      const end = geometry[index + 1];
+      if (!start || !end) {
+        continue;
+      }
+      segments.push({ start, end, bbox: bboxFromPoints([start, end]) });
+    }
+  });
+  return {
+    bbox: jiaminSupplementalBbox(polygonBbox, SUPPLEMENTAL_BBOX_MARGIN_DEGREES),
+    segments
+  };
+}
+
+function jiaminSupplementalBbox(bbox, margin) {
+  const northLimit = jiaminSupplementalNorthLimit(bbox);
+  return {
+    minlat: bbox.minlat - margin,
+    minlon: bbox.minlon - margin,
+    maxlat: Math.min(bbox.maxlat + Math.min(margin, SUPPLEMENTAL_NORTH_MARGIN_DEGREES), northLimit),
+    maxlon: bbox.maxlon + margin
+  };
+}
+
+function jiaminSupplementalNorthLimit(bbox) {
+  return bbox.maxlat - SUPPLEMENTAL_NORTH_TRIM_DEGREES;
+}
+
+function clipWayToJiaminSupplement(way, geometry, polygon, corridor, rank) {
+  if (!corridor.segments.length) {
+    return [];
+  }
+  const tags = way.tags || {};
+  if (!isJiaminSupplementCandidate(tags, rank)) {
+    return [];
+  }
+  const parts = [];
+  let current = null;
+  const namedJiamin = JIAMIN_NAME_PATTERN.test(tags.name || "");
+
+  for (let index = 0; index < geometry.length - 1; index += 1) {
+    const start = geometry[index];
+    const end = geometry[index + 1];
+    if (!start || !end) {
+      flush();
+      continue;
+    }
+    const segmentBbox = bboxFromPoints([start, end]);
+    if (!bboxOverlaps(segmentBbox, corridor.bbox)) {
+      flush();
+      continue;
+    }
+    const clipped = clipSegmentToBbox(start, end, corridor.bbox);
+    if (!clipped) {
+      flush();
+      continue;
+    }
+    const mid = interpolateGeo(start, end, (clipped.t0 + clipped.t1) / 2);
+    if (pointInPolygonOrBoundary(mid, polygon.ring)) {
+      flush();
+      continue;
+    }
+    if (mid.lat > jiaminSupplementalNorthLimit(polygon.bbox)) {
+      flush();
+      continue;
+    }
+    const buffer = namedJiamin ? JIAMIN_MAINLINE_BUFFER_DEGREES : JIAMIN_CORRIDOR_BUFFER_DEGREES;
+    if (!isNearCorridor(mid, corridor.segments, buffer)) {
+      flush();
+      continue;
+    }
+    const startNode = nodeIdForT(way.id, index, way.nodes[index], way.nodes[index + 1], clipped.t0);
+    const endNode = nodeIdForT(way.id, index, way.nodes[index], way.nodes[index + 1], clipped.t1);
+    if (!current) {
+      current = { points: [clipped.start], nodeIds: [startNode], supplemental: true };
+    } else {
+      const last = current.points[current.points.length - 1];
+      const lastNode = current.nodeIds[current.nodeIds.length - 1];
+      if (lastNode !== startNode && pointDistanceDegrees(last, clipped.start) > 1e-9) {
+        flush();
+        current = { points: [clipped.start], nodeIds: [startNode], supplemental: true };
+      }
+    }
+    current.points.push(clipped.end);
+    current.nodeIds.push(endNode);
+  }
+  flush();
+  return parts;
+
+  function flush() {
+    if (current && current.points.length > 1) parts.push(current);
+    current = null;
+  }
+}
+
+function isJiaminSupplementCandidate(tags, rank) {
+  if (JIAMIN_NAME_PATTERN.test(tags.name || "")) {
+    return true;
+  }
+  if (rank >= 5) {
+    return true;
+  }
+  if (/_link$/.test(tags.highway || "")) {
+    return true;
+  }
+  return rank >= 3 && (tags.bridge === "yes" || tags.bridge === "viaduct" || tags.tunnel === "yes" || tags.layer !== undefined);
+}
+
+function isNearCorridor(point, segments, maxDistance) {
+  const pointBbox = {
+    minlat: point.lat - maxDistance,
+    maxlat: point.lat + maxDistance,
+    minlon: point.lon - maxDistance,
+    maxlon: point.lon + maxDistance
+  };
+  return segments.some((segment) => {
+    if (!bboxOverlaps(pointBbox, segment.bbox)) {
+      return false;
+    }
+    return pointToSegmentDistanceDegrees(point, segment.start, segment.end) <= maxDistance;
+  });
+}
+
+function pointToSegmentDistanceDegrees(point, start, end) {
+  const dx = end.lon - start.lon;
+  const dy = end.lat - start.lat;
+  const lengthSquared = dx * dx + dy * dy;
+  if (!lengthSquared) {
+    return pointDistanceDegrees(point, start);
+  }
+  const t = clamp(((point.lon - start.lon) * dx + (point.lat - start.lat) * dy) / lengthSquared, 0, 1);
+  return pointDistanceDegrees(point, {
+    lon: start.lon + dx * t,
+    lat: start.lat + dy * t
+  });
+}
+
+function clipSegmentToBbox(start, end, bbox) {
+  const dx = end.lon - start.lon;
+  const dy = end.lat - start.lat;
+  let t0 = 0;
+  let t1 = 1;
+  if (!clipTest(-dx, start.lon - bbox.minlon)) return null;
+  if (!clipTest(dx, bbox.maxlon - start.lon)) return null;
+  if (!clipTest(-dy, start.lat - bbox.minlat)) return null;
+  if (!clipTest(dy, bbox.maxlat - start.lat)) return null;
+  if (t1 < t0) return null;
+  return {
+    t0,
+    t1,
+    start: interpolateGeo(start, end, t0),
+    end: interpolateGeo(start, end, t1)
+  };
+
+  function clipTest(p, q) {
+    if (Math.abs(p) < EPSILON) return q >= -EPSILON;
+    const r = q / p;
+    if (p < 0) {
+      if (r > t1) return false;
+      if (r > t0) t0 = r;
+    } else {
+      if (r < t0) return false;
+      if (r < t1) t1 = r;
+    }
+    return true;
+  }
+}
+
+function expandBbox(bbox, margin) {
+  return {
+    minlat: bbox.minlat - margin,
+    minlon: bbox.minlon - margin,
+    maxlat: bbox.maxlat + margin,
+    maxlon: bbox.maxlon + margin
+  };
 }
 
 function clipWayToPolygon(way, geometry, polygon) {
