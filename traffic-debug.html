@@ -52,19 +52,19 @@
       <button id="resetBtn">重置</button>
       <button id="fitBtn">适配</button>
       <select id="speedSelect">
-        <option value="1">1x</option>
+        <option value="1" selected>1x</option>
         <option value="4">4x</option>
-        <option value="8" selected>8x</option>
+        <option value="8">8x</option>
         <option value="16">16x</option>
         <option value="32">32x</option>
         <option value="64">64x</option>
       </select>
-      <label class="toggle"><input id="showConnectors" type="checkbox" checked />短连接</label>
-      <label class="toggle"><input id="showDeadEnds" type="checkbox" checked />死路点</label>
-      <label class="toggle"><input id="showRouteGraph" type="checkbox" checked />路由图</label>
+      <label class="toggle"><input id="showConnectors" type="checkbox" />短连接</label>
+      <label class="toggle"><input id="showDeadEnds" type="checkbox" />死路点</label>
+      <label class="toggle"><input id="showRouteGraph" type="checkbox" />路由图</label>
       <label class="toggle"><input id="showExcludedRoads" type="checkbox" />未入图道路</label>
-      <label class="toggle"><input id="showNearMisses" type="checkbox" checked />错位端点</label>
-      <label class="toggle"><input id="showSmallComponents" type="checkbox" checked />小片区</label>
+      <label class="toggle"><input id="showNearMisses" type="checkbox" />错位端点</label>
+      <label class="toggle"><input id="showSmallComponents" type="checkbox" />小片区</label>
       <label class="toggle"><input id="showTrails" type="checkbox" checked />轨迹</label>
       <label class="toggle"><input id="showPlans" type="checkbox" checked />规划线</label>
       <label class="toggle"><input id="boundaryRespawn" type="checkbox" />边界重生</label>
@@ -103,6 +103,9 @@
     <div class="panel" id="events"></div>
   </aside>
 
+  <script src="data/app-data.js"></script>
+  <script src="data/route-graph.js"></script>
+  <script src="js/traffic-graph.js"></script>
   <script>
     const SCENE_WIDTH = 1600;
     const SCENE_HEIGHT = 900;
@@ -139,10 +142,12 @@
     let paused = false;
     let simTime = 1000;
     let lastFrame = performance.now();
+    let lastRoutePlanWallAt = 0;
     let eventLog = [];
+    const forwardPathCache = new Map();
     let roadBounds = { minX: 0, minY: 0, maxX: SCENE_WIDTH, maxY: SCENE_HEIGHT };
     let pointerDown = null;
-    const issueCounts = { loop: 0, deadEnd: 0, boundaryRespawn: 0, deadEndRespawn: 0, uturn: 0, escape: 0 };
+    const issueCounts = { loop: 0, deadEnd: 0, boundaryRespawn: 0, deadEndRespawn: 0, loopRespawn: 0, uturn: 0, escape: 0 };
     const view = { scale: 1, x: 0, y: 0 };
 
     init().catch((error) => {
@@ -151,18 +156,26 @@
     });
 
     async function init() {
-      const html = await fetch("index.html", { cache: "no-store" }).then((response) => response.text());
-      appData = JSON.parse(extractConst(html, "appData"));
-      routeTemplates = JSON.parse(extractConst(html, "routeTemplates"));
+      selectionEl.textContent = "初始化: 读取数据";
+      appData = window.appData;
+      routeTemplates = window.routeTemplates;
+      if (!appData || !routeTemplates) {
+        throw new Error("missing data/app-data.js");
+      }
       roadLookup = new Map(appData.roads.map((road) => [road.id, road]));
       roadBounds = getRoadBounds(appData.roads);
+      selectionEl.textContent = "初始化: 加载持久化路由图";
       routeLibrary = createRouteLibrary();
+      selectionEl.textContent = "初始化: 创建车辆";
       vehicles = createVehicles();
       selectedVehicleId = vehicles[0] ? vehicles[0].id : null;
       wireControls();
       resetView();
       resizeCanvas();
-      logEvent("ready", "已读取 index.html 当前地图数据");
+      logEvent("ready", "已读取 data/app-data.js 和 data/route-graph.js 当前地图数据");
+      selectionEl.textContent = "初始化: 首帧渲染";
+      render();
+      updateSidebar();
       requestAnimationFrame(frame);
     }
 
@@ -387,8 +400,12 @@
 
     function drawRouteGraph() {
       ctx.save();
+      const seen = new Set();
       routeLibrary.allEdges.forEach((edge) => {
-        if (edge.synthetic || !edge.id.endsWith(":f")) return;
+        if (edge.synthetic) return;
+        const key = [edge.from, edge.to, edge.roadId].sort().join("|");
+        if (seen.has(key)) return;
+        seen.add(key);
         const start = worldToScreen(edge.points[0][0], edge.points[0][1]);
         const end = worldToScreen(edge.points[1][0], edge.points[1][1]);
         ctx.beginPath();
@@ -441,9 +458,10 @@
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
         ctx.lineTo(b.x, b.y);
-        ctx.setLineDash(edge.id.includes("escape:") ? [8, 4] : [4, 4]);
+        const edgeId = String(edge.id);
+        ctx.setLineDash(edgeId.includes("escape:") ? [8, 4] : [4, 4]);
         ctx.lineWidth = Math.max(1.4, 1.8 * Math.sqrt(view.scale));
-        ctx.strokeStyle = edge.id.includes("escape:") ? "#d946ef" : "#f28c28";
+        ctx.strokeStyle = edgeId.includes("escape:") ? "#d946ef" : "#f28c28";
         ctx.globalAlpha = 0.85;
         ctx.stroke();
         ctx.setLineDash([]);
@@ -527,7 +545,7 @@
         const p = worldToScreen(vehicle.position.x, vehicle.position.y);
         const angle = Math.atan2(vehicle.currentEdge ? vehicle.currentEdge.vector.y : 0, vehicle.currentEdge ? vehicle.currentEdge.vector.x : 1);
         const size = vehicle.id === selectedVehicleId ? 7 : 5;
-        const color = vehicle.loopSuspect ? "#e03b3b" : vehicle.lastDecision === "planned" || vehicle.lastDecision === "new-plan" ? "#1e9b55" : vehicle.lastDecision === "escape" ? "#c026d3" : vehicle.lastDecision === "local" ? "#d39219" : "#64748b";
+        const color = vehicle.loopSuspect ? "#e03b3b" : vehicle.lastDecision === "planned" || vehicle.lastDecision === "new-plan" || vehicle.lastDecision === "target-local" ? "#1e9b55" : vehicle.lastDecision === "escape" ? "#c026d3" : vehicle.lastDecision === "local" ? "#d39219" : "#64748b";
         ctx.translate(p.x, p.y);
         ctx.rotate(angle);
         ctx.beginPath();
@@ -557,21 +575,28 @@
     function updateSidebar() {
       if (!routeLibrary) return;
       const graph = routeLibrary.graph;
-      const deadEnds = Array.from(graph.adjacency.entries()).filter((entry) => entry[1].length <= 1).length;
+      const neighbors = buildTrafficNeighborMap(graph.nodes, graph.adjacency);
+      const deadEnds = Array.from(neighbors.values()).filter((linkedNodes) => linkedNodes.size <= 1).length;
       const loops = vehicles.filter((vehicle) => vehicle.loopSuspect).length;
       const local = vehicles.filter((vehicle) => vehicle.lastDecision === "local").length;
       const selected = vehicles.find((vehicle) => vehicle.id === selectedVehicleId) || vehicles[0];
       statsEl.innerHTML = [
+        statHtml(graph.routeRoadCount, "入图道路"),
         statHtml(graph.nodes.size, "节点"),
         statHtml(graph.componentCount, "连通片区"),
+        statHtml(graph.largestComponentNodeCount, "最大片区"),
+        statHtml(graph.coreNodeCount, "巡航核心"),
+        statHtml(routeLibrary.driveCoreNodes ? routeLibrary.driveCoreNodes.length : 0, "有向可行核心"),
         statHtml(graph.connectorCount, "短连接"),
+        statHtml(routeLibrary.seedNodes.length, "种子点"),
+        statHtml(routeLibrary.targetNodes.length, "目标点"),
         statHtml(deadEnds, "死路节点"),
         statHtml(graph.diagnostics.deadEndsNearVisualRoad.length, "贴近底图死路"),
         statHtml(graph.diagnostics.excludedVisualEndpoints.length, "未入图端点"),
         statHtml(loops, "疑似循环"),
         statHtml(local, "当前局部兜底"),
         statHtml(issueCounts.uturn, "掉头/急回头"),
-        statHtml(issueCounts.boundaryRespawn + issueCounts.deadEndRespawn, "重生次数")
+        statHtml(issueCounts.boundaryRespawn + issueCounts.deadEndRespawn + issueCounts.loopRespawn, "重生次数")
       ].join("");
 
       const sorted = vehicles.slice().sort((a, b) => {
@@ -602,6 +627,7 @@
           "当前道路: " + (road && road.name ? road.name : selected.currentEdge ? selected.currentEdge.highway : "无"),
           "edge: " + (selected.currentEdge ? selected.currentEdge.id : "无"),
           "component: " + (node ? node.componentId + " / size " + node.componentSize : "无"),
+          "strategy: " + (selected.strategy || "arterial") + ", target: " + (selected.targetNode || "none"),
           "plannedEdges: " + (selected.plannedEdges ? selected.plannedEdges.length : 0),
           "recent bbox: " + Math.round(diag.width || 0) + " x " + Math.round(diag.height || 0),
           "recent cells: " + (diag.cells || 0) + ", edges: " + (diag.uniqueEdges || 0),
@@ -615,7 +641,7 @@
     }
 
     function decisionLabel(value) {
-      return ({ planned: "规划", "new-plan": "新规划", local: "局部", escape: "短逃逸", dead: "死路", respawn: "重生", initial: "初始" })[value] || "巡航";
+      return ({ planned: "规划", "new-plan": "新规划", "target-local": "目标", local: "局部", escape: "短逃逸", dead: "死路", respawn: "重生", initial: "初始" })[value] || "巡航";
     }
 
     function selectNearestVehicle(clientX, clientY) {
@@ -638,25 +664,54 @@
     }
 
     function createRouteLibrary() {
+      selectionEl.textContent = "初始化: hydrate 路由图";
       const graph = buildRoadGraph();
+      selectionEl.textContent = "初始化: 收集种子点";
       const seedNodes = collectRouteSeedNodes(graph);
+      selectionEl.textContent = "初始化: 收集目标点";
       const targetNodes = collectRouteTargetNodes(graph, seedNodes);
-      return { graph, seedNodes, targetNodes, allEdges: graph.allEdges };
+      const boundaryNodes = collectBoundaryRouteNodes(graph);
+      const driveCoreNodes = collectDriveCoreNodes(graph);
+      return { graph, seedNodes, targetNodes, boundaryNodes, driveCoreNodes, driveCoreNodeSet: new Set(driveCoreNodes), allEdges: graph.allEdges };
     }
 
     function buildRoadGraph() {
+      if (window.TrafficGraph) {
+        const graph = window.TRAFFIC_ROUTE_GRAPH
+          ? window.TrafficGraph.hydrateRoadGraph(window.TRAFFIC_ROUTE_GRAPH)
+          : window.TrafficGraph.buildRoadGraph(appData, {
+            mode: "vehicle-core",
+            connectors: false
+          });
+        graph.diagnostics = buildGraphDiagnostics(graph);
+        return graph;
+      }
+
       const nodes = new Map();
       const adjacency = new Map();
       const allEdges = [];
       let edgeCount = 0;
-      const routeRoads = appData.roads.filter((road) => road.rank >= 2 && road.length >= 8 && road.points.length > 1);
-      function nodeKey(point) {
-        return Math.round(point[0] / 3) + ":" + Math.round(point[1] / 3);
+      const routeRoads = appData.roads.filter((road) => road.routable !== false && road.points.length > 1);
+      function nodeKey(point, road, pointIndex) {
+        const osmNodeId = road.nodeIds ? road.nodeIds[pointIndex] : null;
+        if (osmNodeId !== null && osmNodeId !== undefined) {
+          return "osm:" + osmNodeId;
+        }
+        return "coord:" + Math.round(point[0] / 2) + ":" + Math.round(point[1] / 2);
       }
-      function ensureNode(point) {
-        const key = nodeKey(point);
+      function ensureNode(point, road, pointIndex) {
+        const key = nodeKey(point, road, pointIndex);
         if (!nodes.has(key)) {
-          nodes.set(key, { id: key, x: point[0], y: point[1], roads: new Set() });
+          const osmNodeId = road.nodeIds ? road.nodeIds[pointIndex] : null;
+          nodes.set(key, {
+            id: key,
+            x: point[0],
+            y: point[1],
+            osmNodeId,
+            officialOsmNode: typeof osmNodeId === "number",
+            layer: road.layer || 0,
+            roads: new Set()
+          });
           adjacency.set(key, []);
         }
         return key;
@@ -666,35 +721,51 @@
           const start = road.points[index];
           const end = road.points[index + 1];
           const length = distance(start, end);
-          if (length < 3) continue;
-          const from = ensureNode(start);
-          const to = ensureNode(end);
+          if (length < 0.5) continue;
+          const from = ensureNode(start, road, index);
+          const to = ensureNode(end, road, index + 1);
           nodes.get(from).roads.add(road.id);
           nodes.get(to).roads.add(road.id);
           const edgeId = road.id + ":" + index;
-          const forward = createTrafficEdge(edgeId + ":f", road, from, to, start, end, length);
-          const backward = createTrafficEdge(edgeId + ":b", road, to, from, end, start, length);
-          adjacency.get(from).push(forward);
-          adjacency.get(to).push(backward);
-          allEdges.push(forward, backward);
+          const directions = roadDirections(road);
+          if (directions.forward) {
+            const forward = createTrafficEdge(edgeId + ":f", road, from, to, start, end, length);
+            adjacency.get(from).push(forward);
+            allEdges.push(forward);
+          }
+          if (directions.backward) {
+            const backward = createTrafficEdge(edgeId + ":b", road, to, from, end, start, length);
+            adjacency.get(to).push(backward);
+            allEdges.push(backward);
+          }
           edgeCount += 1;
         }
       });
-      const connectorCount = addNearbyTrafficConnectors(nodes, adjacency, allEdges);
+      const connectorCount = 0;
       const componentStats = annotateTrafficComponents(nodes, adjacency);
+      const coreStats = annotateTrafficCore(nodes, adjacency);
       const diagnostics = buildGraphDiagnostics(nodes, adjacency);
-      return { nodes, adjacency, allEdges, diagnostics, edgeCount, connectorCount, componentCount: componentStats.count, largestComponentNodeCount: componentStats.largestNodeCount, routeRoadCount: routeRoads.length };
+      return { nodes, adjacency, allEdges, diagnostics, edgeCount, connectorCount, componentCount: componentStats.count, largestComponentNodeCount: componentStats.largestNodeCount, coreNodeCount: coreStats.coreNodeCount, deadEndBranchNodeCount: coreStats.deadEndBranchNodeCount, routeRoadCount: routeRoads.length };
     }
 
     function createTrafficEdge(edgeId, road, from, to, start, end, length) {
-      return { id: edgeId, roadId: road.id, from, to, rank: road.rank, highway: road.highway || "residential", synthetic: Boolean(road.synthetic), length, points: [start, end], vector: { x: end[0] - start[0], y: end[1] - start[1] } };
+      return { id: edgeId, roadId: road.id, from, to, rank: road.rank, highway: road.highway || "residential", synthetic: Boolean(road.synthetic), layer: road.layer || 0, bridge: Boolean(road.bridge), tunnel: Boolean(road.tunnel), length, points: [start, end], vector: { x: end[0] - start[0], y: end[1] - start[1] } };
+    }
+
+    function roadDirections(road) {
+      if (road.oneway === "reverse") return { forward: false, backward: true };
+      if (road.oneway === "yes") return { forward: true, backward: false };
+      return { forward: true, backward: true };
     }
 
     function addNearbyTrafficConnectors(nodes, adjacency, allEdges) {
-      const cellSize = 6;
+      const looseGap = 1.5;
+      const tightGap = 0.4;
+      const cellSize = looseGap;
       const buckets = new Map();
       const connectorUse = new Map();
       const candidates = [];
+      const neighbors = buildTrafficNeighborMap(nodes, adjacency);
       function bucketKey(x, y) {
         return Math.floor(x / cellSize) + ":" + Math.floor(y / cellSize);
       }
@@ -711,8 +782,13 @@
             const bucket = buckets.get((cellX + dx) + ":" + (cellY + dy)) || [];
             bucket.forEach((other) => {
               if (node.id >= other.id || hasTrafficConnection(adjacency, node.id, other.id)) return;
+              if ((node.layer || 0) !== (other.layer || 0)) return;
+              if (shareTrafficRoad(node, other) || neighbors.get(node.id).has(other.id)) return;
+              const firstDegree = neighbors.get(node.id).size;
+              const secondDegree = neighbors.get(other.id).size;
               const gap = distance(node, other);
-              if (gap > 4.2 || gap < 1.2) return;
+              const allowedGap = firstDegree <= 1 || secondDegree <= 1 ? looseGap : tightGap;
+              if (gap > allowedGap) return;
               const firstProfile = dominantNodeRoadProfile(adjacency, node.id);
               const secondProfile = dominantNodeRoadProfile(adjacency, other.id);
               candidates.push({ from: node, to: other, length: gap, rank: Math.max(2, Math.round((firstProfile.rank + secondProfile.rank) / 2)), highway: betterRoadClass(firstProfile.highway, secondProfile.highway) });
@@ -726,7 +802,7 @@
         const fromCount = connectorUse.get(candidate.from.id) || 0;
         const toCount = connectorUse.get(candidate.to.id) || 0;
         if (fromCount >= 1 || toCount >= 1 || hasTrafficConnection(adjacency, candidate.from.id, candidate.to.id)) return;
-        const road = { id: "connector:" + candidate.from.id + ":" + candidate.to.id, rank: candidate.rank, highway: candidate.highway, synthetic: true };
+        const road = { id: "connector:" + candidate.from.id + ":" + candidate.to.id, rank: candidate.rank, highway: candidate.highway, layer: candidate.from.layer || 0, synthetic: true };
         const start = [candidate.from.x, candidate.from.y];
         const end = [candidate.to.x, candidate.to.y];
         const forward = createTrafficEdge(road.id + ":f", road, candidate.from.id, candidate.to.id, start, end, candidate.length);
@@ -741,7 +817,32 @@
       return added;
     }
 
+    function shareTrafficRoad(firstNode, secondNode) {
+      if (!firstNode.roads || !secondNode.roads) return false;
+      for (const roadId of firstNode.roads) {
+        if (secondNode.roads.has(roadId)) return true;
+      }
+      return false;
+    }
+
+    function buildTrafficNeighborMap(nodes, adjacency) {
+      const neighbors = new Map();
+      nodes.forEach((node, nodeId) => {
+        neighbors.set(nodeId, new Set());
+      });
+      adjacency.forEach((edges, nodeId) => {
+        edges.forEach((edge) => {
+          if (!nodes.has(edge.to)) return;
+          neighbors.get(nodeId).add(edge.to);
+          neighbors.get(edge.to).add(nodeId);
+        });
+      });
+      return neighbors;
+    }
+
     function annotateTrafficComponents(nodes, adjacency) {
+      const neighbors = buildTrafficNeighborMap(nodes, adjacency);
+
       let componentId = 0;
       let largestNodeCount = 0;
       nodes.forEach((node, nodeId) => {
@@ -756,11 +857,11 @@
           const current = nodes.get(currentId);
           if (!current) continue;
           componentNodes.push(currentId);
-          (adjacency.get(currentId) || []).forEach((edge) => {
-            const nextNode = nodes.get(edge.to);
+          (neighbors.get(currentId) || []).forEach((nextId) => {
+            const nextNode = nodes.get(nextId);
             if (!nextNode || nextNode.componentId !== undefined) return;
             nextNode.componentId = componentId;
-            queue.push(edge.to);
+            queue.push(nextId);
           });
         }
         largestNodeCount = Math.max(largestNodeCount, componentNodes.length);
@@ -773,16 +874,52 @@
       return { count: componentId, largestNodeCount };
     }
 
-    function buildGraphDiagnostics(nodes, adjacency) {
+    function annotateTrafficCore(nodes, adjacency) {
+      const neighbors = buildTrafficNeighborMap(nodes, adjacency);
+      const degree = new Map();
+      const queue = [];
+      neighbors.forEach((linkedNodes, nodeId) => {
+        degree.set(nodeId, linkedNodes.size);
+        if (linkedNodes.size <= 1) queue.push(nodeId);
+      });
+      const removed = new Set();
+      let queueIndex = 0;
+      while (queueIndex < queue.length) {
+        const nodeId = queue[queueIndex];
+        queueIndex += 1;
+        if (removed.has(nodeId) || (degree.get(nodeId) || 0) > 1) continue;
+        removed.add(nodeId);
+        (neighbors.get(nodeId) || []).forEach((neighborId) => {
+          if (removed.has(neighborId)) return;
+          const nextDegree = (degree.get(neighborId) || 0) - 1;
+          degree.set(neighborId, nextDegree);
+          if (nextDegree <= 1) queue.push(neighborId);
+        });
+      }
+      let coreNodeCount = 0;
+      nodes.forEach((node, nodeId) => {
+        node.isTrafficCore = !removed.has(nodeId);
+        if (node.isTrafficCore) coreNodeCount += 1;
+      });
+      return { coreNodeCount, deadEndBranchNodeCount: removed.size };
+    }
+
+    function buildGraphDiagnostics(graphOrNodes, adjacency) {
+      const nodes = graphOrNodes.nodes || graphOrNodes;
+      adjacency = graphOrNodes.adjacency || adjacency;
+      if (graphOrNodes.precomputed) {
+        return { deadEndsNearVisualRoad: [], excludedVisualEndpoints: [] };
+      }
       const drawnRoads = appData.roads.filter(isDrawnRoad);
       const graphNodes = [...nodes.values()];
       const segmentBuckets = buildRoadSegmentBuckets(drawnRoads, 18);
       const nodeBuckets = buildNodeBuckets(graphNodes, 4);
+      const neighbors = buildTrafficNeighborMap(nodes, adjacency);
       const deadEndsNearVisualRoad = [];
       const excludedVisualEndpoints = [];
 
       graphNodes.forEach((node) => {
-        const degree = (adjacency.get(node.id) || []).length;
+        const degree = (neighbors.get(node.id) || new Set()).size;
         if (degree > 1) return;
         const nearest = findNearestNonIncidentRoad(node, segmentBuckets, 18);
         if (nearest && nearest.distance <= 2) {
@@ -884,7 +1021,7 @@
     }
 
     function isRouteRoad(road) {
-      return road.rank >= 2 && road.length >= 8 && road.points.length > 1;
+      return road.routable !== false && road.points.length > 1;
     }
 
     function hasTrafficConnection(adjacency, from, to) {
@@ -908,7 +1045,7 @@
 
     function isUsableTrafficNode(graph, nodeId) {
       const node = graph.nodes.get(nodeId);
-      return Boolean(node && (node.componentSize || 0) >= trafficComponentThreshold(graph));
+      return Boolean(node && node.isTrafficCore && (node.componentSize || 0) >= trafficComponentThreshold(graph));
     }
 
     function filterUsableTrafficNodes(graph, nodeIds) {
@@ -940,19 +1077,83 @@
 
     function collectRouteTargetNodes(graph, seedNodes) {
       const targets = [];
+      const targetSet = new Set();
       graph.adjacency.forEach((edges, nodeId) => {
         if (!graph.nodes.has(nodeId) || !isUsableTrafficNode(graph, nodeId)) return;
         const realEdges = edges.filter((edge) => !edge.synthetic);
         const hasMainRoad = realEdges.some((edge) => edge.rank >= 6);
         const hasChoice = realEdges.length >= 3;
-        if (hasChoice && (hasMainRoad || edges.length >= 4) && !targets.includes(nodeId)) targets.push(nodeId);
+        if (hasChoice && (hasMainRoad || edges.length >= 4) && !targetSet.has(nodeId)) {
+          targetSet.add(nodeId);
+          targets.push(nodeId);
+        }
       });
       seedNodes.forEach((nodeId) => {
         if (!isUsableTrafficNode(graph, nodeId)) return;
         const realEdges = (graph.adjacency.get(nodeId) || []).filter((edge) => !edge.synthetic);
-        if (realEdges.length >= 3 && !targets.includes(nodeId)) targets.push(nodeId);
+        if (realEdges.length >= 3 && !targetSet.has(nodeId)) {
+          targetSet.add(nodeId);
+          targets.push(nodeId);
+        }
       });
       return targets.length ? targets : filterUsableTrafficNodes(graph, [...graph.nodes.keys()]);
+    }
+
+    function collectBoundaryRouteNodes(graph) {
+      const nodes = [];
+      const nodeSet = new Set();
+      const threshold = 24;
+      graph.nodes.forEach((node, nodeId) => {
+        if (!isUsableTrafficNode(graph, nodeId)) return;
+        if (node.boundaryClip && nodeRoadRank(graph, nodeId) >= 5) {
+          nodeSet.add(nodeId);
+          nodes.push(nodeId);
+          return;
+        }
+        const nearBoundary = node.x <= roadBounds.minX + threshold
+          || node.x >= roadBounds.maxX - threshold
+          || node.y <= roadBounds.minY + threshold
+          || node.y >= roadBounds.maxY - threshold;
+        if (nearBoundary && nodeRoadRank(graph, nodeId) >= 5 && !nodeSet.has(nodeId)) nodes.push(nodeId);
+      });
+      return nodes;
+    }
+
+    function collectDriveCoreNodes(graph) {
+      const outCount = new Map();
+      const reverse = new Map();
+      graph.nodes.forEach((node, nodeId) => {
+        outCount.set(nodeId, 0);
+        reverse.set(nodeId, []);
+      });
+      graph.adjacency.forEach((edges, from) => {
+        edges.forEach((edge) => {
+          if (!isTrafficSyntheticTraversable(edge)) return;
+          outCount.set(from, (outCount.get(from) || 0) + 1);
+          if (reverse.has(edge.to)) reverse.get(edge.to).push(from);
+        });
+      });
+      const removed = new Set();
+      const queue = [];
+      outCount.forEach((count, nodeId) => {
+        if (count <= 0) queue.push(nodeId);
+      });
+      while (queue.length) {
+        const nodeId = queue.shift();
+        if (removed.has(nodeId)) continue;
+        removed.add(nodeId);
+        (reverse.get(nodeId) || []).forEach((previousNode) => {
+          if (removed.has(previousNode)) return;
+          const nextCount = (outCount.get(previousNode) || 0) - 1;
+          outCount.set(previousNode, nextCount);
+          if (nextCount <= 0) queue.push(previousNode);
+        });
+      }
+      const core = [];
+      graph.nodes.forEach((node, nodeId) => {
+        if (!removed.has(nodeId) && isUsableTrafficNode(graph, nodeId)) core.push(nodeId);
+      });
+      return core;
     }
 
     function findClosestGraphNode(graph, point) {
@@ -968,6 +1169,25 @@
       return best;
     }
 
+    function vehicleStrategy(index) {
+      if (index % 5 === 0) return "through";
+      if (index % 3 === 0) return "local";
+      return "arterial";
+    }
+
+    function nodeRoadRank(graph, nodeId) {
+      const edges = graph.adjacency.get(nodeId) || [];
+      if (!edges.length) return 1;
+      return edges.reduce((rank, edge) => Math.max(rank, edge.rank || 1), 1);
+    }
+
+    function targetDistanceForStrategy(strategy, componentSize) {
+      if ((componentSize || 0) < 180) return strategy === "local" ? 120 : 180;
+      if (strategy === "through") return 560;
+      if (strategy === "arterial") return 340;
+      return 170;
+    }
+
     function createVehicles() {
       const list = [];
       const graph = routeLibrary.graph;
@@ -979,7 +1199,8 @@
         const fallbackNode = graph.nodes.get(seedNode) || { x: SCENE_WIDTH / 2, y: SCENE_HEIGHT / 2 };
         const position = currentEdge ? sampleEdge(currentEdge, edgeProgress) : { x: fallbackNode.x, y: fallbackNode.y };
         const personality = 0.9 + (index % 6) * 0.045;
-        list.push({
+        const strategy = vehicleStrategy(index);
+        const vehicle = {
           id: "V-" + String(index + 1).padStart(3, "0"),
           currentEdge,
           edgeProgress,
@@ -988,6 +1209,9 @@
           recentEdges: currentEdge ? [currentEdge.id] : [],
           recentNodes: currentEdge ? [currentEdge.from, currentEdge.to] : [seedNode],
           plannedEdges: [],
+          strategy,
+          tripCount: 0,
+          nextRoutePlanAt: simTime + index * 900,
           personality,
           speed: currentEdge ? getVehicleCruiseSpeed(currentEdge, personality) : 0,
           position,
@@ -1001,8 +1225,21 @@
           uturns: 0,
           respawns: 0,
           spawnGraceUntil: simTime + 3000,
+          stopUntil: 0,
+          slowUntil: 0,
+          slowFactor: 1,
+          turnSlowdownUntil: 0,
+          turnSlowFactor: 1,
+          consecutiveTurns: 0,
+          lastTurnTime: -10000,
+          nextIncidentCheck: simTime + 1800 + index * 360,
+          targetNode: null,
+          targetPoint: null,
+          bestTargetDistance: Infinity,
           diagnostics: {}
-        });
+        };
+        if (currentEdge) assignVehicleTarget(graph, currentEdge.to, vehicle, index);
+        list.push(vehicle);
       }
       return list;
     }
@@ -1010,10 +1247,17 @@
     function chooseInitialTrafficEdge(graph, seedNode, salt) {
       const initialEdges = graph.adjacency.get(seedNode) || [];
       let candidates = preferRealTrafficEdges(filterDeadEndCandidates(graph, initialEdges));
-      if (!candidates.length) candidates = preferRealTrafficEdges(initialEdges);
       if (!candidates.length) {
         const fallback = Array.from(graph.adjacency.entries()).find((entry) => isUsableTrafficNode(graph, entry[0]) && filterDeadEndCandidates(graph, entry[1]).length);
         candidates = fallback ? preferRealTrafficEdges(filterDeadEndCandidates(graph, fallback[1])) : [];
+      }
+      if (!candidates.length) {
+        candidates = routeLibrary.allEdges.filter((edge) => !edge.synthetic
+          && edge.rank >= 6
+          && isUsableTrafficNode(graph, edge.from)
+          && isDriveCoreNode(graph, edge.from)
+          && isDriveCoreNode(graph, edge.to)
+          && hasImmediateForwardExit(graph, edge));
       }
       if (!candidates.length) return null;
       return weightedChoice(candidates.map((edge, index) => ({
@@ -1027,7 +1271,11 @@
         if (controls.deadEndRespawn.checked) respawnVehicle(vehicle, timestamp, "deadEndRespawn");
         return;
       }
-      const speed = getVehicleCruiseSpeed(vehicle.currentEdge, vehicle.personality);
+      maybeStartTrafficSlowdown(vehicle, timestamp);
+      let speed = getVehicleCruiseSpeed(vehicle.currentEdge, vehicle.personality);
+      if (timestamp < vehicle.turnSlowdownUntil) speed *= vehicle.turnSlowFactor;
+      if (timestamp < vehicle.slowUntil) speed *= vehicle.slowFactor;
+      if (timestamp < vehicle.stopUntil && !isElevatedOrExpressway(vehicle.currentEdge)) speed = 0;
       vehicle.speed = speed;
       let remaining = speed * dt;
       let guard = 0;
@@ -1053,7 +1301,7 @@
           vehicle.lastDecision = "dead";
           issueCounts.deadEnd += 1;
           logEvent("dead-end", vehicle.id + " 到达无可用出口节点 " + arrivalNode, timestamp);
-          if (controls.deadEndRespawn.checked) respawnVehicle(vehicle, timestamp, "deadEndRespawn");
+          respawnVehicle(vehicle, timestamp, isBoundaryDeadEndNode(routeLibrary.graph, arrivalNode, incomingEdge) ? "boundaryRespawn" : "deadEndRespawn");
           vehicle.speed = 0;
           remaining = 0;
           break;
@@ -1069,6 +1317,11 @@
         vehicle.currentEdge = nextEdge;
         vehicle.edgeProgress = 0;
         rememberVehiclePath(vehicle, nextEdge);
+        updateTurnSlowdown(vehicle, alignment, timestamp);
+        maybeStopAtIntersection(vehicle, arrivalNode, incomingEdge, nextEdge, alignment, timestamp);
+        if (timestamp < vehicle.stopUntil) {
+          remaining = 0;
+        }
       }
       vehicle.position = sampleEdge(vehicle.currentEdge, vehicle.edgeProgress);
       vehicle.trail.push({ x: vehicle.position.x, y: vehicle.position.y });
@@ -1078,13 +1331,51 @@
     function chooseNextTrafficEdge(graph, nodeId, vehicle, incomingEdge, salt, timestamp) {
       const outgoing = graph.adjacency.get(nodeId) || [];
       if (!outgoing.length) return null;
+      const legalOutgoing = outgoing.filter((edge) => isLegalTrafficTransition(graph, incomingEdge, edge));
+      if (!legalOutgoing.length) return null;
       const previousNode = incomingEdge.from;
+      if (!vehicle.targetNode || isVehicleTargetReached(graph, nodeId, vehicle)) {
+        assignVehicleTarget(graph, nodeId, vehicle, salt);
+      }
       const plannedEdge = takePlannedTrafficEdge(graph, nodeId, vehicle, incomingEdge);
       if (plannedEdge) {
         vehicle.lastDecision = "planned";
         return plannedEdge;
       }
-      const plannedRoute = planTrafficRoute(graph, nodeId, vehicle, incomingEdge, salt);
+      let candidates = legalOutgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.18);
+      if (!candidates.length) candidates = legalOutgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.48);
+      if (!candidates.length) candidates = legalOutgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.82);
+      if (!candidates.length) {
+        const escapeEdge = graph.precomputed ? null : createShortEscapeEdge(graph, nodeId, incomingEdge, previousNode);
+        if (escapeEdge) {
+          vehicle.lastDecision = "escape";
+          vehicle.escapes += 1;
+          issueCounts.escape += 1;
+          logEvent("escape", vehicle.id + " 使用临时短逃逸边 " + nodeId + " -> " + escapeEdge.to, timestamp);
+          return escapeEdge;
+        }
+      }
+      if (!candidates.length) return null;
+      const cruiseCandidates = candidates.filter((edge) => isCruiseTrafficEdge(graph, edge));
+      if (cruiseCandidates.length) candidates = cruiseCandidates;
+      const forwardCandidates = filterDeadEndCandidates(graph, candidates);
+      if (forwardCandidates.length) candidates = forwardCandidates;
+      else {
+        const safeOutgoing = filterDeadEndCandidates(graph, legalOutgoing)
+          .filter((edge) => edge.to !== previousNode || legalOutgoing.length === 1);
+        if (safeOutgoing.length) candidates = safeOutgoing;
+        else {
+          const coreOutgoing = legalOutgoing.filter((edge) => edge.to !== previousNode
+            && isDriveCoreNode(graph, edge.to)
+            && isTrafficSyntheticTraversable(edge)
+            && vectorAlignment(incomingEdge.vector, edge.vector) > -0.82);
+          if (coreOutgoing.length) candidates = coreOutgoing;
+          else return null;
+        }
+      }
+      const plannedRoute = shouldPlanTrafficRoute(graph, nodeId, vehicle, candidates, timestamp)
+        ? planTrafficRoute(graph, nodeId, vehicle, incomingEdge, salt)
+        : [];
       if (plannedRoute.length) {
         vehicle.plannedEdges = plannedRoute;
         const routedEdge = takePlannedTrafficEdge(graph, nodeId, vehicle, incomingEdge);
@@ -1094,30 +1385,23 @@
         }
       }
       vehicle.plannedEdges = [];
-      let candidates = outgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.18);
-      if (!candidates.length) candidates = outgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.48);
-      if (!candidates.length) candidates = outgoing.filter((edge) => edge.to !== previousNode && vectorAlignment(incomingEdge.vector, edge.vector) > -0.82);
-      if (!candidates.length) {
-        const escapeEdge = createShortEscapeEdge(graph, nodeId, incomingEdge, previousNode);
-        if (escapeEdge) {
-          vehicle.lastDecision = "escape";
-          vehicle.escapes += 1;
-          issueCounts.escape += 1;
-          logEvent("escape", vehicle.id + " 使用临时短逃逸边 " + nodeId + " -> " + escapeEdge.to, timestamp);
-          return escapeEdge;
-        }
-      }
-      if (!candidates.length) candidates = outgoing;
-      const forwardCandidates = filterDeadEndCandidates(graph, candidates);
-      if (forwardCandidates.length) candidates = forwardCandidates;
       candidates = preferRealTrafficEdges(candidates);
-      vehicle.lastDecision = "local";
+      vehicle.lastDecision = vehicle.targetNode ? "target-local" : "local";
       vehicle.localFallbacks += 1;
+      const currentNode = graph.nodes.get(nodeId);
+      const targetNode = graph.nodes.get(vehicle.targetNode);
+      const currentTargetDistance = currentNode && targetNode ? distance(currentNode, targetNode) : 0;
+      if (targetNode && currentTargetDistance < vehicle.bestTargetDistance) {
+        vehicle.bestTargetDistance = currentTargetDistance;
+      }
       return weightedChoice(candidates.map((edge, index) => {
         const alignment = vectorAlignment(incomingEdge.vector, edge.vector);
+        const nextNode = graph.nodes.get(edge.to);
+        const targetProgress = nextNode && targetNode ? currentTargetDistance - distance(nextNode, targetNode) : 0;
         let weight = roadPreference(edge);
         weight *= 0.7 + Math.max(0, alignment) * 1.9;
         weight *= rankTransitionPreference(incomingEdge, edge, alignment);
+        weight *= targetProgressPreference(vehicle, edge, targetProgress);
         if (alignment < -0.55) weight *= 0.003;
         else if (alignment < -0.15) weight *= 0.045;
         else if (alignment < 0.25) weight *= 0.48;
@@ -1128,6 +1412,18 @@
         weight *= 0.84 + rng() * 0.36 + (((salt + 7) * (index + 17)) % 11) / 80;
         return { item: edge, weight: Math.max(0.01, weight) };
       }));
+    }
+
+    function shouldPlanTrafficRoute(graph, nodeId, vehicle, candidates, timestamp) {
+      if (vehicle.nextRoutePlanAt && timestamp < vehicle.nextRoutePlanAt) return false;
+      if (candidates.length <= 1) return false;
+      const now = performance.now();
+      const minWallGap = graph.precomputed ? 110 : 45;
+      if (now - lastRoutePlanWallAt < minWallGap) return false;
+      lastRoutePlanWallAt = now;
+      const strategyDelay = vehicle.strategy === "through" ? 5200 : vehicle.strategy === "arterial" ? 4200 : 3000;
+      vehicle.nextRoutePlanAt = timestamp + strategyDelay + rng() * 1800;
+      return true;
     }
 
     function createShortEscapeEdge(graph, nodeId, incomingEdge, previousNode) {
@@ -1169,6 +1465,14 @@
           vehicle.plannedEdges = [];
           return null;
         }
+        if (graph.precomputed && (!isDriveCoreNode(graph, edge.to) || !hasImmediateForwardExit(graph, edge))) {
+          vehicle.plannedEdges = [];
+          return null;
+        }
+        if (!isLegalTrafficTransition(graph, incomingEdge, edge)) {
+          vehicle.plannedEdges = [];
+          return null;
+        }
         const alignment = vectorAlignment(incomingEdge.vector, edge.vector);
         if (edge.to !== incomingEdge.from && alignment > -0.82) return edge;
         vehicle.plannedEdges = [];
@@ -1177,44 +1481,134 @@
       return null;
     }
 
+    function assignVehicleTarget(graph, nodeId, vehicle, salt) {
+      const targets = selectTrafficRouteTargets(graph, nodeId, vehicle, salt);
+      if (!targets.length) {
+        vehicle.targetNode = null;
+        vehicle.targetPoint = null;
+        vehicle.bestTargetDistance = Infinity;
+        return null;
+      }
+      const targetId = targets[Math.floor(rng() * targets.length)] || targets[0];
+      const targetNode = graph.nodes.get(targetId);
+      if (!targetNode) return null;
+      vehicle.targetNode = targetId;
+      vehicle.targetPoint = { x: targetNode.x, y: targetNode.y };
+      const currentNode = graph.nodes.get(nodeId);
+      vehicle.bestTargetDistance = currentNode ? distance(currentNode, targetNode) : Infinity;
+      return targetId;
+    }
+
+    function isVehicleTargetReached(graph, nodeId, vehicle) {
+      const targetNode = graph.nodes.get(vehicle.targetNode);
+      const currentNode = graph.nodes.get(nodeId);
+      if (!targetNode || !currentNode) return true;
+      const value = distance(currentNode, targetNode);
+      if (value < (vehicle.strategy === "through" ? 130 : vehicle.strategy === "arterial" ? 90 : 65)) return true;
+      if (vehicle.bestTargetDistance < Infinity && value > vehicle.bestTargetDistance + 260 && vehicle.localFallbacks % 18 === 0) return true;
+      return false;
+    }
+
+    function targetProgressPreference(vehicle, edge, progress) {
+      let weight = 1;
+      if (progress > 60) weight *= 3.1;
+      else if (progress > 25) weight *= 2.2;
+      else if (progress > 5) weight *= 1.45;
+      else if (progress < -90) weight *= 0.2;
+      else if (progress < -35) weight *= 0.42;
+      else if (progress < -8) weight *= 0.72;
+
+      if (vehicle.strategy === "through") {
+        if (edge.rank >= 7) weight *= 2.6;
+        else if (edge.rank >= 5) weight *= 1.5;
+        else if (edge.rank <= 3) weight *= 0.28;
+      } else if (vehicle.strategy === "arterial") {
+        if (edge.rank >= 6) weight *= 1.8;
+        else if (edge.rank <= 3) weight *= 0.55;
+      } else if (edge.rank <= 4) {
+        weight *= 1.25;
+      }
+      return weight;
+    }
+
     function planTrafficRoute(graph, nodeId, vehicle, incomingEdge, salt) {
       const targets = selectTrafficRouteTargets(graph, nodeId, vehicle, salt);
       if (!targets.length) return [];
-      return findTrafficPath(graph, nodeId, new Set(targets), vehicle, incomingEdge);
+      const route = findTrafficPath(graph, nodeId, new Set(targets), vehicle, incomingEdge);
+      if (route.length) vehicle.tripCount += 1;
+      return route;
     }
 
     function selectTrafficRouteTargets(graph, nodeId, vehicle, salt) {
       const startNode = graph.nodes.get(nodeId);
       if (!startNode) return [];
-      const routeTargets = routeLibrary.targetNodes.length ? routeLibrary.targetNodes : [...graph.nodes.keys()];
-      const sameComponentTargets = routeTargets.filter((targetId) => {
+      const strategy = vehicle.strategy || "arterial";
+      const primaryPool = strategy === "through" && routeLibrary.boundaryNodes.length
+        ? routeLibrary.boundaryNodes
+        : routeLibrary.targetNodes;
+      const routeTargets = primaryPool.length ? primaryPool : [...graph.nodes.keys()];
+      let pool = routeTargets.filter((targetId) => {
         const targetNode = graph.nodes.get(targetId);
-        return targetNode && targetNode.componentId === startNode.componentId;
+        return targetNode && targetNode.componentId === startNode.componentId && isUsableTrafficNode(graph, targetId) && isDriveCoreNode(graph, targetId);
       });
-      const sameComponentFallback = [...graph.nodes.keys()].filter((targetId) => {
-        const targetNode = graph.nodes.get(targetId);
-        return targetNode && targetNode.componentId === startNode.componentId;
-      });
-      const pool = sameComponentTargets.length ? sameComponentTargets : sameComponentFallback;
-      if (!pool.length) return [];
-      const targets = [];
-      const attempts = Math.min(pool.length, 60);
-      const minTargetDistance = (startNode.componentSize || 0) < 160 ? 110 : 220;
-      for (let attempt = 0; attempt < attempts && targets.length < 10; attempt += 1) {
-        const index = (salt * 37 + attempt * 53 + Math.floor(rng() * pool.length)) % pool.length;
-        const targetId = pool[index];
-        const targetNode = graph.nodes.get(targetId);
-        if (!targetNode || targetId === nodeId || targets.includes(targetId) || vehicle.recentNodes.includes(targetId)) continue;
-        if (distance(startNode, targetNode) < minTargetDistance && attempt < attempts - 8) continue;
-        targets.push(targetId);
+      if (!pool.length && strategy === "through") {
+        pool = routeLibrary.targetNodes.filter((targetId) => {
+          const targetNode = graph.nodes.get(targetId);
+          return targetNode && targetNode.componentId === startNode.componentId && isUsableTrafficNode(graph, targetId) && isDriveCoreNode(graph, targetId);
+        });
       }
-      return targets;
+      if (!pool.length) {
+        pool = [...graph.nodes.keys()].filter((targetId) => {
+          const targetNode = graph.nodes.get(targetId);
+          return targetNode && targetNode.componentId === startNode.componentId && isUsableTrafficNode(graph, targetId) && isDriveCoreNode(graph, targetId);
+        });
+      }
+      if (!pool.length) return [];
+      const minTargetDistance = targetDistanceForStrategy(strategy, startNode.componentSize);
+      const candidates = pool.map((targetId) => {
+        const targetNode = graph.nodes.get(targetId);
+        if (!targetNode || targetId === nodeId || vehicle.recentNodes.includes(targetId)) return null;
+        const targetDistance = distance(startNode, targetNode);
+        const rank = nodeRoadRank(graph, targetId);
+        let weight = 1 + Math.max(0, rank - 2) * 0.55;
+        if (strategy === "through") {
+          weight *= rank >= 7 ? 5.4 : rank >= 5 ? 2.2 : 0.35;
+          weight *= routeLibrary.boundaryNodes.includes(targetId) ? 3.8 : 1;
+        } else if (strategy === "arterial") {
+          weight *= rank >= 6 ? 4.2 : rank >= 5 ? 2.4 : rank <= 3 ? 0.35 : 1;
+        } else {
+          weight *= rank <= 4 ? 2.2 : 0.85;
+        }
+        weight *= clamp(targetDistance / Math.max(160, minTargetDistance), 0.35, 3.2);
+        return { id: targetId, distance: targetDistance, weight };
+      }).filter(Boolean);
+      const distantTargets = candidates.filter((target) => target.distance >= minTargetDistance);
+      const selectedTargets = distantTargets.length ? distantTargets : candidates;
+      const targetCount = strategy === "through" ? 48 : strategy === "arterial" ? 36 : 24;
+      return pickWeightedTargetIds(selectedTargets, targetCount, salt);
+    }
+
+    function pickWeightedTargetIds(targets, count, salt) {
+      const selected = [];
+      const available = targets.slice();
+      while (available.length && selected.length < count) {
+        const choice = weightedChoice(available.map((target, index) => ({
+          item: target,
+          weight: target.weight * (0.82 + rng() * 0.35 + (((salt + 11) * (index + 5)) % 13) / 70)
+        })));
+        if (!choice) break;
+        selected.push(choice.id);
+        const index = available.findIndex((target) => target.id === choice.id);
+        if (index >= 0) available.splice(index, 1);
+      }
+      return selected;
     }
 
     function findTrafficPath(graph, startNodeId, targetNodes, vehicle, incomingEdge) {
-      const minTravelDistance = 180;
-      const maxTravelDistance = 1600;
-      const maxIterations = 2600;
+      const strategy = vehicle.strategy || "arterial";
+      const minTravelDistance = strategy === "through" ? 520 : strategy === "arterial" ? 300 : 150;
+      const maxTravelDistance = strategy === "through" ? 2700 : strategy === "arterial" ? 1850 : 980;
+      const maxIterations = strategy === "through" ? 4800 : strategy === "arterial" ? 3600 : 1900;
       const startRecord = { nodeId: startNodeId, previousNode: incomingEdge.from, previousVector: incomingEdge.vector, previousEdge: incomingEdge, edge: null, parent: null, cost: 0, distance: 0 };
       const heap = [startRecord];
       const bestCost = new Map([[trafficStateKey(startRecord.nodeId, startRecord.previousNode), 0]]);
@@ -1227,7 +1621,9 @@
         if (targetNodes.has(record.nodeId) && record.distance >= minTravelDistance) return reconstructTrafficPath(record);
         const outgoing = graph.adjacency.get(record.nodeId) || [];
         outgoing.forEach((edge) => {
-          if (edge.to === record.previousNode || (edge.synthetic && edge.length > 4.2)) return;
+          if (edge.to === record.previousNode || !isTrafficSyntheticTraversable(edge)) return;
+          if (!isLegalTrafficTransition(graph, record.previousEdge, edge)) return;
+          if (graph.precomputed && (!isDriveCoreNode(graph, edge.to) || !hasImmediateForwardExit(graph, edge))) return;
           const alignment = vectorAlignment(record.previousVector, edge.vector);
           if (alignment <= -0.82) return;
           const nextDistance = record.distance + edge.length;
@@ -1257,7 +1653,7 @@
       if (previousEdge && edge.roadId === previousEdge.roadId && alignment > 0.35) cost *= 0.72;
       if (edge.rank >= 7) cost *= 0.78;
       else if (edge.rank <= 3) cost *= 1.42;
-      if (edge.synthetic) cost += 120;
+      if (edge.synthetic) cost += edge.syntheticKind === "short-extension" ? 42 : 120;
       return Math.max(1, cost);
     }
 
@@ -1303,7 +1699,26 @@
     }
 
     function filterDeadEndCandidates(graph, candidates) {
-      return candidates.filter((edge) => hasForwardPathAfterEdge(graph, edge));
+      if (graph.precomputed) {
+        return candidates.filter((edge) => isCruiseTrafficEdge(graph, edge)
+          && isDriveCoreNode(graph, edge.to)
+          && isTrafficSyntheticTraversable(edge)
+          && hasImmediateForwardExit(graph, edge));
+      }
+      return candidates.filter((edge) => isCruiseTrafficEdge(graph, edge) && hasForwardPathAfterEdge(graph, edge));
+    }
+
+    function isDriveCoreNode(graph, nodeId) {
+      if (!graph.precomputed || !routeLibrary || !routeLibrary.driveCoreNodeSet) return true;
+      return routeLibrary.driveCoreNodeSet.has(nodeId);
+    }
+
+    function hasCachedForwardPathAfterEdge(graph, edge) {
+      const cacheKey = edge.id + "|" + edge.to;
+      if (forwardPathCache.has(cacheKey)) return forwardPathCache.get(cacheKey);
+      const value = hasForwardPathAfterEdge(graph, edge);
+      forwardPathCache.set(cacheKey, value);
+      return value;
     }
 
     function preferRealTrafficEdges(candidates) {
@@ -1311,24 +1726,101 @@
       return realEdges.length ? realEdges : candidates;
     }
 
+    function isCruiseTrafficEdge(graph, edge) {
+      const targetNode = graph.nodes.get(edge.to);
+      return Boolean(targetNode && targetNode.isTrafficCore && isUsableTrafficNode(graph, edge.to));
+    }
+
     function hasForwardPathAfterEdge(graph, edge) {
-      const targetDistance = edge.rank <= 3 ? 46 : 72;
-      const stack = [{ nodeId: edge.to, previousNode: edge.from, previousVector: edge.vector, distance: 0, depth: 0, visited: new Set([edge.id]) }];
+      const targetDistance = edge.rank <= 3 ? 70 : edge.rank >= 6 ? 150 : 110;
+      const minDisplacement = edge.rank <= 3 ? 45 : edge.rank >= 6 ? 85 : 65;
+      const originNode = graph.nodes.get(edge.from);
+      const stack = [{ nodeId: edge.to, previousNode: edge.from, previousVector: edge.vector, previousEdge: edge, distance: 0, depth: 0, visited: new Set([edge.id]) }];
       while (stack.length) {
         const state = stack.pop();
-        const exits = (graph.adjacency.get(state.nodeId) || []).filter((nextEdge) => nextEdge.to !== state.previousNode && !state.visited.has(nextEdge.id) && vectorAlignment(state.previousVector, nextEdge.vector) > -0.82);
+        const exits = (graph.adjacency.get(state.nodeId) || []).filter((nextEdge) => nextEdge.to !== state.previousNode
+          && !state.visited.has(nextEdge.id)
+          && isLegalTrafficTransition(graph, state.previousEdge, nextEdge)
+          && vectorAlignment(state.previousVector, nextEdge.vector) > -0.82);
         for (const nextEdge of exits) {
-          if (nextEdge.synthetic && nextEdge.length > 4.2) continue;
+          if (!isTrafficSyntheticTraversable(nextEdge)) continue;
           const nextDistance = state.distance + nextEdge.length;
           const nextDepth = state.depth + 1;
-          if (nextDistance >= targetDistance) return true;
-          if (nextDepth >= 8) continue;
+          if (nextDistance >= targetDistance) {
+            const exitNode = graph.nodes.get(nextEdge.to);
+            if (!originNode || !exitNode || distance(originNode, exitNode) >= minDisplacement) return true;
+          }
+          if (nextDepth >= 14) continue;
           const visited = new Set(state.visited);
           visited.add(nextEdge.id);
-          stack.push({ nodeId: nextEdge.to, previousNode: nextEdge.from, previousVector: nextEdge.vector, distance: nextDistance, depth: nextDepth, visited });
+          stack.push({ nodeId: nextEdge.to, previousNode: nextEdge.from, previousVector: nextEdge.vector, previousEdge: nextEdge, distance: nextDistance, depth: nextDepth, visited });
         }
       }
       return false;
+    }
+
+    function hasImmediateForwardExit(graph, edge) {
+      return (graph.adjacency.get(edge.to) || [])
+        .some((nextEdge) => nextEdge.to !== edge.from
+          && isLegalTrafficTransition(graph, edge, nextEdge)
+          && vectorAlignment(edge.vector, nextEdge.vector) > -0.82
+          && isTrafficSyntheticTraversable(nextEdge));
+    }
+
+    function isTrafficSyntheticTraversable(edge) {
+      if (!edge.synthetic) return true;
+      if (edge.syntheticKind === "short-extension") return edge.length <= (edge.rank >= 6 ? 18 : 8);
+      if (edge.syntheticKind === "repair-connector") return edge.length <= 2.5;
+      if (edge.syntheticKind === "short-junction") return edge.length <= 3.2;
+      return edge.length <= 4.2;
+    }
+
+    function isLegalTrafficTransition(graph, incomingEdge, nextEdge) {
+      if (!nextEdge || !isTrafficSyntheticTraversable(nextEdge)) return false;
+      if (!graph.nodes.has(nextEdge.to)) return false;
+      if (!incomingEdge) return true;
+      if (!isTrafficSyntheticTraversable(incomingEdge)) return false;
+      const alignment = vectorAlignment(incomingEdge.vector, nextEdge.vector);
+      if (nextEdge.to === incomingEdge.from || alignment < -0.55) return false;
+      const sameRoad = nextEdge.roadId === incomingEdge.roadId;
+      const incomingLink = isLinkEdge(incomingEdge);
+      const nextLink = isLinkEdge(nextEdge);
+      const incomingSeparated = isGradeSeparatedEdge(incomingEdge);
+      const nextSeparated = isGradeSeparatedEdge(nextEdge);
+      const gradeChanges = edgeGradeSignature(incomingEdge) !== edgeGradeSignature(nextEdge);
+
+      if (incomingSeparated && gradeChanges && !incomingLink && !nextLink) {
+        const straightContinuation = alignment > 0.86 && (sameRoad || nextEdge.rank >= incomingEdge.rank - 1);
+        if (!straightContinuation) return false;
+      }
+      if (isElevatedMainline(incomingEdge) && !nextLink) {
+        if (!nextSeparated && nextEdge.rank <= 5 && !sameRoad) return false;
+        if (alignment < 0.52 && !sameRoad && nextEdge.rank < incomingEdge.rank) return false;
+      }
+      if (incomingEdge.rank >= 8 && !incomingLink && !nextLink && nextEdge.rank <= 5 && !sameRoad) return false;
+      if (incomingEdge.rank >= 7 && !nextLink && nextEdge.rank <= 4 && alignment < 0.82 && !sameRoad) return false;
+      if (incomingSeparated && !nextSeparated && !incomingLink && !nextLink && nextEdge.rank < incomingEdge.rank && alignment < 0.86 && !sameRoad) return false;
+      return true;
+    }
+
+    function isLinkEdge(edge) {
+      return Boolean(edge && /_link$/.test(edge.highway || ""));
+    }
+
+    function isGradeSeparatedEdge(edge) {
+      return Boolean(edge && (edge.bridge || edge.tunnel || (edge.layer || 0) !== 0));
+    }
+
+    function edgeGradeSignature(edge) {
+      if (!edge) return "none";
+      return `${edge.layer || 0}:${edge.bridge ? 1 : 0}:${edge.tunnel ? 1 : 0}`;
+    }
+
+    function isElevatedMainline(edge) {
+      return Boolean(edge
+        && !isLinkEdge(edge)
+        && !edge.tunnel
+        && (edge.rank >= 8 || edge.bridge || (edge.layer || 0) > 0));
     }
 
     function rankTransitionPreference(incomingEdge, nextEdge, alignment) {
@@ -1386,6 +1878,7 @@
         vehicle.lastLoopEvent = timestamp;
         issueCounts.loop += 1;
         logEvent("small-loop", vehicle.id + " 在 " + Math.round(width) + "x" + Math.round(height) + " 范围内经过 " + edges.size + " 条边", timestamp);
+        respawnVehicle(vehicle, timestamp, "loopRespawn");
       } else if (!compact && vehicle.loopSuspect && width > 190 && height > 190) {
         vehicle.loopSuspect = false;
       }
@@ -1402,14 +1895,25 @@
       vehicle.recentEdges = [edge.id];
       vehicle.recentNodes = [edge.from, edge.to];
       vehicle.plannedEdges = [];
+      vehicle.nextRoutePlanAt = timestamp + rng() * 900;
       vehicle.trail = [vehicle.position];
       vehicle.samples = [];
+      vehicle.diagnostics = {};
       vehicle.loopSuspect = false;
       vehicle.lastDecision = "respawn";
       vehicle.respawns += 1;
       vehicle.spawnGraceUntil = timestamp + 4000;
+      vehicle.stopUntil = 0;
+      vehicle.slowUntil = 0;
+      vehicle.slowFactor = 1;
+      vehicle.turnSlowdownUntil = 0;
+      vehicle.turnSlowFactor = 1;
+      vehicle.consecutiveTurns = 0;
+      vehicle.nextIncidentCheck = timestamp + 1800 + rng() * 3800;
+      assignVehicleTarget(routeLibrary.graph, edge.to, vehicle, Math.floor(timestamp));
       if (reason === "boundaryRespawn") issueCounts.boundaryRespawn += 1;
       if (reason === "deadEndRespawn") issueCounts.deadEndRespawn += 1;
+      if (reason === "loopRespawn") issueCounts.loopRespawn += 1;
       logEvent(reason, vehicle.id + " 从 " + (edge.highway || "road") + " 重新进入", timestamp);
     }
 
@@ -1419,10 +1923,24 @@
         const to = routeLibrary.graph.nodes.get(edge.to);
         if (!from || !to || edge.synthetic) return false;
         if (!isUsableTrafficNode(routeLibrary.graph, edge.from)) return false;
+        if (!isDriveCoreNode(routeLibrary.graph, edge.from) || !isDriveCoreNode(routeLibrary.graph, edge.to)) return false;
         if (reason === "boundaryRespawn" && !(isBoundaryNode(edge.from) || isBoundaryNode(edge.to))) return false;
-        return edge.rank >= 5 && hasForwardPathAfterEdge(routeLibrary.graph, edge);
+        return edge.rank >= 6 && (routeLibrary.graph.precomputed ? hasImmediateForwardExit(routeLibrary.graph, edge) : hasForwardPathAfterEdge(routeLibrary.graph, edge));
       });
-      if (!candidates.length) candidates = routeLibrary.allEdges.filter((edge) => !edge.synthetic && edge.rank >= 6);
+      if (!candidates.length) {
+        candidates = routeLibrary.allEdges.filter((edge) => !edge.synthetic
+          && edge.rank >= 7
+          && isUsableTrafficNode(routeLibrary.graph, edge.from)
+          && isDriveCoreNode(routeLibrary.graph, edge.from)
+          && isDriveCoreNode(routeLibrary.graph, edge.to));
+      }
+      if (!candidates.length) {
+        candidates = routeLibrary.allEdges.filter((edge) => !edge.synthetic
+          && edge.rank >= 6
+          && isUsableTrafficNode(routeLibrary.graph, edge.from)
+          && isDriveCoreNode(routeLibrary.graph, edge.from)
+          && isDriveCoreNode(routeLibrary.graph, edge.to));
+      }
       if (!candidates.length) return null;
       return weightedChoice(candidates.map((edge) => ({ item: edge, weight: roadPreference(edge) * (edge.rank >= 7 ? 2 : 1) * Math.max(1, edge.length) })));
     }
@@ -1430,8 +1948,106 @@
     function isBoundaryNode(nodeId) {
       const node = routeLibrary.graph.nodes.get(nodeId);
       if (!node) return false;
+      if (node.boundaryClip) return true;
       const threshold = 18;
       return node.x <= roadBounds.minX + threshold || node.x >= roadBounds.maxX - threshold || node.y <= roadBounds.minY + threshold || node.y >= roadBounds.maxY - threshold;
+    }
+
+    function isNearMapBoundary(point, threshold) {
+      return point.x <= roadBounds.minX + threshold
+        || point.x >= roadBounds.maxX - threshold
+        || point.y <= roadBounds.minY + threshold
+        || point.y >= roadBounds.maxY - threshold;
+    }
+
+    function nearestMapBoundary(point) {
+      const candidates = [
+        { side: "west", distance: Math.abs(point.x - roadBounds.minX), normal: { x: -1, y: 0 } },
+        { side: "east", distance: Math.abs(roadBounds.maxX - point.x), normal: { x: 1, y: 0 } },
+        { side: "north", distance: Math.abs(point.y - roadBounds.minY), normal: { x: 0, y: -1 } },
+        { side: "south", distance: Math.abs(roadBounds.maxY - point.y), normal: { x: 0, y: 1 } }
+      ];
+      return candidates.reduce((best, item) => (item.distance < best.distance ? item : best), candidates[0]);
+    }
+
+    function isBoundaryDeadEndNode(graph, nodeId, incomingEdge) {
+      const node = graph.nodes.get(nodeId);
+      if (!node) return false;
+      if (node.boundaryClip) return true;
+      if (!incomingEdge || !isNearMapBoundary(node, 24)) return false;
+      const boundary = nearestMapBoundary(node);
+      return Boolean(boundary && vectorAlignment(incomingEdge.vector, boundary.normal) > 0.18);
+    }
+
+    function maybeStopAtIntersection(vehicle, nodeId, incomingEdge, nextEdge, alignment, timestamp) {
+      const degree = (routeLibrary.graph.adjacency.get(nodeId) || []).length;
+      if (degree < 3 || timestamp < vehicle.stopUntil) return;
+      if (isFreeFlowStraight(incomingEdge, nextEdge, alignment)) {
+        vehicle.stopUntil = 0;
+        return;
+      }
+      let stopChance = 0.035 + Math.min(0.12, Math.max(0, degree - 3) * 0.012);
+      if (incomingEdge.rank <= 3 || nextEdge.rank <= 3) stopChance += 0.045;
+      if (alignment < 0.45) stopChance += 0.045;
+      if (incomingEdge.rank >= 7 && nextEdge.rank >= 7) stopChance *= 0.28;
+      if (vehicle.strategy === "through") stopChance *= 0.45;
+      if (rng() < stopChance) vehicle.stopUntil = timestamp + 240 + rng() * 980;
+    }
+
+    function isFreeFlowStraight(incomingEdge, nextEdge, alignment) {
+      return isElevatedOrExpressway(incomingEdge)
+        && isElevatedOrExpressway(nextEdge)
+        && alignment > 0.58;
+    }
+
+    function isElevatedOrExpressway(edge) {
+      return edge.rank >= 8
+        || edge.highway === "motorway"
+        || edge.highway === "trunk"
+        || edge.highway === "motorway_link"
+        || edge.highway === "trunk_link"
+        || edge.bridge
+        || edge.tunnel
+        || (edge.layer || 0) > 0;
+    }
+
+    function updateTurnSlowdown(vehicle, alignment, timestamp) {
+      if (alignment >= 0.86) {
+        if (timestamp - vehicle.lastTurnTime > 1800) vehicle.consecutiveTurns = 0;
+        return;
+      }
+      if (timestamp - vehicle.lastTurnTime < 2200) {
+        vehicle.consecutiveTurns = Math.min(4, vehicle.consecutiveTurns + 1);
+      } else {
+        vehicle.consecutiveTurns = 1;
+      }
+      vehicle.lastTurnTime = timestamp;
+
+      let baseFactor = 0.82;
+      if (alignment < 0.2) baseFactor = 0.62;
+      else if (alignment < 0.55) baseFactor = 0.76;
+      else baseFactor = 0.9;
+      const continuousPenalty = (vehicle.consecutiveTurns - 1) * 0.06;
+      vehicle.turnSlowFactor = Math.max(0.5, baseFactor - continuousPenalty);
+      vehicle.turnSlowdownUntil = Math.max(
+        vehicle.turnSlowdownUntil,
+        timestamp + 360 + vehicle.consecutiveTurns * 220 + rng() * 180
+      );
+    }
+
+    function maybeStartTrafficSlowdown(vehicle, timestamp) {
+      if (timestamp < vehicle.nextIncidentCheck || timestamp < vehicle.slowUntil) return;
+      vehicle.nextIncidentCheck = timestamp + 2400 + rng() * 5600;
+      const edge = vehicle.currentEdge;
+      let chance = 0.018;
+      if (edge.rank <= 3) chance += 0.018;
+      else if (edge.rank >= 7) chance *= 0.55;
+      if (rng() < chance) {
+        vehicle.slowUntil = timestamp + 1800 + rng() * 5200;
+        vehicle.slowFactor = 0.22 + rng() * 0.42;
+      } else {
+        vehicle.slowFactor = 1;
+      }
     }
 
     function getVehicleCruiseSpeed(edge, personality) {

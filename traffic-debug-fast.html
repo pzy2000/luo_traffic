@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>闵行路由图静态诊断</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      height: 100vh;
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      background: #101418;
+      color: #d9e2ea;
+      font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+      overflow: hidden;
+    }
+    canvas { width: 100%; height: 100%; display: block; background: #151a20; }
+    aside {
+      border-left: 1px solid #2d3640;
+      background: #171d24;
+      padding: 14px;
+      overflow: auto;
+    }
+    h1 { margin: 0 0 12px; font-size: 18px; }
+    .controls, .stats, .legend { display: grid; gap: 8px; }
+    .controls { margin-bottom: 14px; }
+    label, button, select { font: inherit; color: #d9e2ea; }
+    button, select {
+      height: 32px;
+      border: 1px solid #394552;
+      border-radius: 6px;
+      background: #202832;
+    }
+    label { display: flex; align-items: center; gap: 8px; min-height: 28px; }
+    .stats { grid-template-columns: repeat(2, 1fr); margin: 12px 0 16px; }
+    .stat {
+      padding: 8px;
+      border: 1px solid #2d3640;
+      border-radius: 6px;
+      background: #1d242c;
+    }
+    .stat b { display: block; color: #ffffff; font-size: 18px; }
+    .stat span { color: #91a3b4; font-size: 12px; }
+    .legend div { display: flex; align-items: center; gap: 8px; color: #aebdca; }
+    .key { width: 22px; height: 3px; display: inline-block; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .hint { margin-top: 14px; color: #91a3b4; font-size: 12px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <canvas id="map"></canvas>
+  <aside>
+    <h1>静态路网诊断</h1>
+    <div class="controls">
+      <button id="fitBtn">适配视图</button>
+      <label>图模式
+        <select id="modeSelect">
+          <option value="full" selected>完整可通行图</option>
+          <option value="vehicle-core">车辆核心图</option>
+          <option value="arterial">主次干道图</option>
+        </select>
+      </label>
+      <label><input id="connectorsToggle" type="checkbox" />短连接</label>
+      <label><input id="routeToggle" type="checkbox" checked />路由边</label>
+      <label><input id="deadToggle" type="checkbox" checked />死路点</label>
+      <label><input id="coreToggle" type="checkbox" />巡航核心点</label>
+      <label><input id="smallToggle" type="checkbox" checked />小连通片区</label>
+    </div>
+    <div class="stats" id="stats"></div>
+    <div class="legend">
+      <div><span class="key" style="background:#4b5563"></span>OSM 可见道路</div>
+      <div><span class="key" style="background:#00b5ad"></span>真实路由边</div>
+      <div><span class="key" style="background:#f59e0b"></span>预计算修复/短连接</div>
+      <div><span class="dot" style="background:#ef4444"></span>死路节点</div>
+      <div><span class="dot" style="background:#22c55e"></span>巡航核心</div>
+      <div><span class="dot" style="background:#8b5cf6"></span>小片区</div>
+    </div>
+    <div class="hint">
+      这个页面不跑车辆动画，只绘制当前持久化路由图，适合观察连通性、死路节点、预计算修复连接和小片区。
+      滚轮缩放，拖拽平移。
+    </div>
+  </aside>
+  <script src="data/app-data.js"></script>
+  <script src="data/route-graph.js"></script>
+  <script src="js/traffic-graph.js"></script>
+  <script>
+    const canvas = document.getElementById("map");
+    const ctx = canvas.getContext("2d");
+    const statsEl = document.getElementById("stats");
+    const controls = {
+      fitBtn: document.getElementById("fitBtn"),
+      modeSelect: document.getElementById("modeSelect"),
+      connectorsToggle: document.getElementById("connectorsToggle"),
+      routeToggle: document.getElementById("routeToggle"),
+      deadToggle: document.getElementById("deadToggle"),
+      coreToggle: document.getElementById("coreToggle"),
+      smallToggle: document.getElementById("smallToggle")
+    };
+    const view = { scale: 1, x: 0, y: 0 };
+    let graph = null;
+    let bounds = null;
+    let pointer = null;
+
+    init();
+
+    function init() {
+      resize();
+      rebuild();
+      wireControls();
+      window.addEventListener("resize", () => { resize(); draw(); });
+    }
+
+    function rebuild() {
+      const started = performance.now();
+      if (window.TRAFFIC_ROUTE_GRAPH) {
+        graph = TrafficGraph.hydrateRoadGraph(window.TRAFFIC_ROUTE_GRAPH);
+      } else {
+        graph = TrafficGraph.buildRoadGraph(window.appData, {
+          mode: controls.modeSelect.value,
+          connectors: controls.connectorsToggle.checked
+        });
+      }
+      graph.buildMs = Math.round(performance.now() - started);
+      bounds = getRoadBounds(window.appData.roads);
+      fit();
+      renderStats();
+      draw();
+    }
+
+    function renderStats() {
+      const smallComponents = Array.from(graph.nodes.values()).filter((node) => (node.componentSize || 0) < 80).length;
+      const threshold = trafficComponentThreshold(graph);
+      const usableNodes = Array.from(graph.nodes.values()).filter((node) => node.isTrafficCore && (node.componentSize || 0) >= threshold).length;
+      const usableEdges = graph.allEdges.filter((edge) => {
+        const node = graph.nodes.get(edge.to);
+        return node && node.isTrafficCore && (node.componentSize || 0) >= threshold;
+      }).length;
+      const routeGraph = window.TRAFFIC_ROUTE_GRAPH;
+      statsEl.innerHTML = [
+        stat(window.appData.roads.length, "显示道路"),
+        stat(dataSourceLabel(), "数据源"),
+        stat(routeGraph?.topology || "geometry", "路由拓扑"),
+        stat(routeGraph?.nodes?.length || graph.nodes.size, "持久化节点"),
+        stat(routeGraph?.edges?.length || graph.allEdges.length, "持久化边"),
+        stat(routeGraph?.largestComponentNodeCount || graph.largestComponentNodeCount, "持久化最大片区"),
+        stat(graph.routeRoadCount || graph.routeRoads.length, "入图道路"),
+        stat(graph.nodes.size, "节点"),
+        stat(graph.allEdges.length, "有向边"),
+        stat(usableNodes, "可巡航节点"),
+        stat(usableEdges, "可巡航边"),
+        stat(graph.componentCount, "连通片区"),
+        stat(graph.largestComponentNodeCount, "最大片区"),
+        stat(graph.coreNodeCount, "巡航核心"),
+        stat(graph.deadEndNodes.length, "死路点"),
+        stat(graph.geometryRepairCount || routeGraph?.geometryRepairCount || 0, "几何修复"),
+        stat(graph.connectorCount, "短连接"),
+        stat(smallComponents, "小片区节点"),
+        stat(graph.buildMs + "ms", "载入耗时")
+      ].join("");
+    }
+
+    function stat(value, label) {
+      return `<div class="stat"><b>${value}</b><span>${label}</span></div>`;
+    }
+
+    function dataSourceLabel() {
+      const source = window.MAP_METADATA.source || "";
+      if (source.includes("Strict OSM")) return "Strict OSM";
+      if (source.includes("Geofabrik") || source.includes("PBF")) return "PBF";
+      if (source.includes("GDAL")) return "GDAL";
+      return "Overpass";
+    }
+
+    function trafficComponentThreshold(graph) {
+      return Math.max(24, Math.floor((graph.largestComponentNodeCount || graph.nodes.size) * 0.035));
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawRoads();
+      if (controls.routeToggle.checked) drawRouteEdges();
+      if (controls.smallToggle.checked) drawSmallComponents();
+      if (controls.coreToggle.checked) drawCoreNodes();
+      if (controls.deadToggle.checked) drawDeadEnds();
+    }
+
+    function drawRoads() {
+      ctx.save();
+      ctx.lineCap = "round";
+      window.appData.roads.forEach((road) => {
+        if (road.points.length < 2) return;
+        ctx.beginPath();
+        road.points.forEach((point, index) => {
+          const screen = worldToScreen(point[0], point[1]);
+          if (index === 0) ctx.moveTo(screen.x, screen.y);
+          else ctx.lineTo(screen.x, screen.y);
+        });
+        ctx.globalAlpha = road.routable === false ? 0.14 : 0.28;
+        ctx.strokeStyle = road.routable === false ? "#7c3aed" : "#64748b";
+        ctx.lineWidth = Math.max(0.5, (road.width || 1) * view.scale * 0.35);
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    function drawRouteEdges() {
+      ctx.save();
+      ctx.lineCap = "round";
+      const seen = new Set();
+      graph.allEdges.forEach((edge) => {
+        const fromKey = String(edge.from);
+        const toKey = String(edge.to);
+        const key = fromKey < toKey ? fromKey + "|" + toKey : toKey + "|" + fromKey;
+        if (seen.has(key)) return;
+        seen.add(key);
+        const start = worldToScreen(edge.points[0][0], edge.points[0][1]);
+        const end = worldToScreen(edge.points[1][0], edge.points[1][1]);
+        ctx.beginPath();
+        ctx.moveTo(start.x, start.y);
+        ctx.lineTo(end.x, end.y);
+        ctx.strokeStyle = edge.synthetic ? "#f59e0b" : "#00b5ad";
+        ctx.globalAlpha = edge.synthetic ? 0.72 : 0.36;
+        ctx.lineWidth = edge.synthetic ? 1.4 : 0.8;
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    function drawDeadEnds() {
+      drawNodes(graph.deadEndNodes, "#ef4444", 1.7, 0.8);
+    }
+
+    function drawCoreNodes() {
+      drawNodes(Array.from(graph.nodes.values()).filter((node) => node.isTrafficCore), "#22c55e", 1.2, 0.45);
+    }
+
+    function drawSmallComponents() {
+      drawNodes(Array.from(graph.nodes.values()).filter((node) => (node.componentSize || 0) < 80), "#8b5cf6", 1.4, 0.5);
+    }
+
+    function drawNodes(nodes, color, radius, alpha) {
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.globalAlpha = alpha;
+      nodes.forEach((node) => {
+        const screen = worldToScreen(node.x, node.y);
+        ctx.beginPath();
+        ctx.arc(screen.x, screen.y, Math.max(radius, radius * view.scale), 0, Math.PI * 2);
+        ctx.fill();
+      });
+      ctx.restore();
+    }
+
+    function fit() {
+      const pad = 30;
+      const scaleX = (canvas.width - pad * 2) / Math.max(1, bounds.maxX - bounds.minX);
+      const scaleY = (canvas.height - pad * 2) / Math.max(1, bounds.maxY - bounds.minY);
+      view.scale = Math.min(scaleX, scaleY);
+      view.x = pad - bounds.minX * view.scale + ((canvas.width - pad * 2) - (bounds.maxX - bounds.minX) * view.scale) / 2;
+      view.y = pad - bounds.minY * view.scale + ((canvas.height - pad * 2) - (bounds.maxY - bounds.minY) * view.scale) / 2;
+    }
+
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(rect.width));
+      canvas.height = Math.max(1, Math.floor(rect.height));
+    }
+
+    function wireControls() {
+      controls.fitBtn.addEventListener("click", () => { fit(); draw(); });
+      [controls.modeSelect, controls.connectorsToggle].forEach((control) => control.addEventListener("change", rebuild));
+      [controls.routeToggle, controls.deadToggle, controls.coreToggle, controls.smallToggle].forEach((control) => control.addEventListener("change", draw));
+      canvas.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        const factor = event.deltaY < 0 ? 1.15 : 0.87;
+        const before = screenToWorld(event.offsetX, event.offsetY);
+        view.scale *= factor;
+        view.x = event.offsetX - before.x * view.scale;
+        view.y = event.offsetY - before.y * view.scale;
+        draw();
+      }, { passive: false });
+      canvas.addEventListener("pointerdown", (event) => {
+        pointer = { x: event.clientX, y: event.clientY, viewX: view.x, viewY: view.y };
+        canvas.setPointerCapture(event.pointerId);
+      });
+      canvas.addEventListener("pointermove", (event) => {
+        if (!pointer) return;
+        view.x = pointer.viewX + event.clientX - pointer.x;
+        view.y = pointer.viewY + event.clientY - pointer.y;
+        draw();
+      });
+      canvas.addEventListener("pointerup", () => { pointer = null; });
+    }
+
+    function worldToScreen(x, y) {
+      return { x: x * view.scale + view.x, y: y * view.scale + view.y };
+    }
+
+    function screenToWorld(x, y) {
+      return { x: (x - view.x) / view.scale, y: (y - view.y) / view.scale };
+    }
+
+    function getRoadBounds(roads) {
+      const next = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+      roads.forEach((road) => road.points.forEach((point) => {
+        next.minX = Math.min(next.minX, point[0]);
+        next.maxX = Math.max(next.maxX, point[0]);
+        next.minY = Math.min(next.minY, point[1]);
+        next.maxY = Math.max(next.maxY, point[1]);
+      }));
+      return next;
+    }
+  </script>
+</body>
+</html>
