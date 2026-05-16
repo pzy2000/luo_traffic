@@ -134,8 +134,13 @@ async function main() {
     osmTimestamp: raw.osmTimestamp
   });
 
+  const {
+    supplementalSummary: _discardSupplementalSummary,
+    highRankContinuityAudit: _discardHighRankContinuityAudit,
+    ...baseMetadata
+  } = metadata;
   const nextMetadata = {
-    ...metadata,
+    ...baseMetadata,
     source: "Strict OSM node-ref topology from Shanghai PBF with bounded Jiamin corridor supplement",
     licence: "Data © OpenStreetMap contributors, ODbL 1.0",
     geofabrikUrl: null,

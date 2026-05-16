@@ -6,6 +6,7 @@ const ROOT = process.cwd();
 const SIM_SECONDS = Number(process.argv.find((arg) => arg.startsWith("--seconds="))?.split("=")[1] || 150);
 const STEP_MS = Number(process.argv.find((arg) => arg.startsWith("--step-ms="))?.split("=")[1] || 100);
 const SCENARIO = process.argv.find((arg) => arg.startsWith("--scenario="))?.split("=")[1] || "current";
+const INSPECT_EDGE = process.argv.find((arg) => arg.startsWith("--inspect-edge="))?.split("=")[1] || "";
 const START_MS = 10000;
 
 let fakeNow = START_MS;
@@ -140,12 +141,14 @@ function loadRuntime() {
           canParkNaturally,
           canStopOrParkOnEdge,
           hasImmediateForwardExit,
+          hasSustainedForwardPathAfterEdge,
           isDriveCoreNode,
           isCruiseTrafficEdge,
           isRouteSearchNode,
           nodeRoadRank,
           edgeMidpoint,
           nearestMapBoundary,
+          vectorAlignment,
           distance,
           sampleEdge
         };
@@ -239,6 +242,11 @@ function edgeInfoById(edgeId, internals) {
   const edges = internals.routeLibrary.allEdges || [];
   const edge = edges.find((item) => String(item.id) === String(edgeId));
   return edgeInfo(edge, internals);
+}
+
+function edgeById(edgeId, internals) {
+  const edges = internals.routeLibrary.allEdges || [];
+  return edges.find((item) => String(item.id) === String(edgeId)) || null;
 }
 
 function nodeInfo(nodeId, internals) {
@@ -530,6 +538,29 @@ function analyzeGraph(internals) {
   };
 }
 
+function inspectEdge(edgeId, internals) {
+  const graph = internals.routeLibrary.graph;
+  const edge = edgeById(edgeId, internals);
+  if (!edge) {
+    return { error: `edge ${edgeId} not found` };
+  }
+  const outgoing = graph.adjacency.get(edge.to) || [];
+  return {
+    edge: edgeInfo(edge, internals),
+    toNode: nodeInfo(edge.to, internals),
+    hasImmediateForwardExit: internals.hasImmediateForwardExit(graph, edge),
+    hasSustainedForwardPathAfterEdge: internals.hasSustainedForwardPathAfterEdge(graph, edge),
+    outgoing: outgoing.map((nextEdge) => ({
+      edge: edgeInfo(nextEdge, internals),
+      legal: internals.isLegalTrafficTransition(graph, edge, nextEdge),
+      sustained: internals.hasSustainedForwardPathAfterEdge(graph, nextEdge),
+      alignment: round(internals.vectorAlignment(edge.vector, nextEdge.vector), 4),
+      backtrack: nextEdge.to === edge.from,
+      syntheticTraversable: internals.isTrafficSyntheticTraversable(nextEdge)
+    }))
+  };
+}
+
 function summarizeSmallClosedSccs(allEdges, nextByIndex, internals) {
   const index = { value: 0 };
   const stack = [];
@@ -631,6 +662,10 @@ function histogram(items, keyFn) {
 }
 
 const internals = loadRuntime();
+if (INSPECT_EDGE) {
+  console.log(JSON.stringify(inspectEdge(INSPECT_EDGE, internals), null, 2));
+  process.exit(0);
+}
 const graphReport = analyzeGraph(internals);
 const simReport = simulate(internals);
 printReport(graphReport, simReport);

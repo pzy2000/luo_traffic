@@ -1,0 +1,306 @@
+{
+  "version": 2,
+  "savedAt": "2026-05-16T16:19:23.394Z",
+  "pbf": "shanghai-260513.osm.pbf",
+  "includeMissing": [
+    {
+      "code": "SH-00019",
+      "osmId": "186479661",
+      "segmentIndex": 1
+    },
+    {
+      "code": "SH-00514",
+      "osmId": "186479661",
+      "segmentIndex": 2
+    },
+    {
+      "code": "SH-00698",
+      "osmId": "411268475",
+      "segmentIndex": 6
+    },
+    {
+      "code": "SH-00644",
+      "osmId": "377968797",
+      "segmentIndex": 5
+    },
+    {
+      "code": "SH-00424",
+      "osmId": "509435193",
+      "segmentIndex": 6
+    },
+    {
+      "code": "SH-00547",
+      "osmId": "186479658",
+      "segmentIndex": 3
+    },
+    {
+      "code": "SH-00537",
+      "osmId": "186479658",
+      "segmentIndex": 2
+    },
+    {
+      "code": "SH-00464",
+      "osmId": "186478701",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-00468",
+      "osmId": "1207398110",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-00466",
+      "osmId": "186503934",
+      "segmentIndex": 6
+    },
+    {
+      "code": "SH-00501",
+      "osmId": "1207694710",
+      "segmentIndex": 2
+    },
+    {
+      "code": "SH-00502",
+      "osmId": "1207694716",
+      "segmentIndex": 1
+    },
+    {
+      "code": "SH-00026",
+      "osmId": "1234889333",
+      "segmentIndex": 1
+    },
+    {
+      "code": "SH-16558",
+      "osmId": "1234889333",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-03703",
+      "osmId": "93850767",
+      "segmentIndex": 6
+    },
+    {
+      "code": "SH-03897",
+      "osmId": "93850767",
+      "segmentIndex": 5
+    },
+    {
+      "code": "SH-22844",
+      "osmId": "662728083",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-22849",
+      "osmId": "662728066",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-147906",
+      "osmId": "232265138",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-108106",
+      "osmId": "1423248739",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-111100",
+      "osmId": "1423248740",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-01349",
+      "osmId": "867494968",
+      "segmentIndex": 1
+    },
+    {
+      "code": "SH-01342",
+      "osmId": "867494969",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-01670",
+      "osmId": "966901226",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-182454",
+      "osmId": "1238056674",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-00423",
+      "osmId": "509435220",
+      "segmentIndex": 18
+    },
+    {
+      "code": "SH-01428",
+      "osmId": "1149399394",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-01445",
+      "osmId": "1149399395",
+      "segmentIndex": 5
+    },
+    {
+      "code": "SH-03459",
+      "osmId": "1149399401",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-03453",
+      "osmId": "69553984",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-00340",
+      "osmId": "1290378280",
+      "segmentIndex": 13
+    },
+    {
+      "code": "SH-00341",
+      "osmId": "741576210",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-02493",
+      "osmId": "766527858",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-02850",
+      "osmId": "766531967",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-00536",
+      "osmId": "69827541",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-00512",
+      "osmId": "347353538",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-06123",
+      "osmId": "1375584234",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-04374",
+      "osmId": "467572732",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-03299",
+      "osmId": "467572731",
+      "segmentIndex": 1
+    },
+    {
+      "code": "SH-149694",
+      "osmId": "1237551322",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-149695",
+      "osmId": "838927061",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-149864",
+      "osmId": "838927063",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-354600",
+      "osmId": "838927068",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-348266",
+      "osmId": "838927070",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-22776",
+      "osmId": "108723281",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-22775",
+      "osmId": "108723278",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-22754",
+      "osmId": "108723274",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-22755",
+      "osmId": "108723302",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-00337",
+      "osmId": "1174715022",
+      "segmentIndex": 2
+    },
+    {
+      "code": "SH-00368",
+      "osmId": "108723249",
+      "segmentIndex": 2
+    },
+    {
+      "code": "SH-00299",
+      "osmId": "1174715022",
+      "segmentIndex": 3
+    },
+    {
+      "code": "SH-00300",
+      "osmId": "108723249",
+      "segmentIndex": 1
+    },
+    {
+      "code": "SH-31601",
+      "osmId": "91847362",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-31600",
+      "osmId": "1293479664",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-60774",
+      "osmId": "1337436444",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-60775",
+      "osmId": "1337436445",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-110456",
+      "osmId": "1311202708",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-252086",
+      "osmId": "1310639055",
+      "segmentIndex": 0
+    },
+    {
+      "code": "SH-183542",
+      "osmId": "1237551324",
+      "segmentIndex": 0
+    }
+  ],
+  "candidateAdd": [],
+  "candidateNo": [],
+  "manualLinks": [],
+  "banAreas": []
+}

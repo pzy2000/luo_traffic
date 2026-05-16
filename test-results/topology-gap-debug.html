@@ -1,0 +1,1131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Topology Gap Inspector</title>
+  <style>
+    :root { color-scheme: light; font-family: Arial, "Microsoft YaHei", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; display: grid; grid-template-columns: minmax(620px, 1fr) 420px; height: 100vh; color: #17202a; background: #eef2f6; }
+    #stage { position: relative; min-width: 0; min-height: 0; background: #f8fafc; }
+    #map { width: 100%; height: 100%; display: block; cursor: crosshair; }
+    #map.dragging { cursor: grabbing; }
+    #toolbar { position: absolute; left: 14px; top: 14px; display: flex; align-items: center; gap: 6px; padding: 7px; border: 1px solid rgba(15, 23, 42, .12); border-radius: 6px; background: rgba(255,255,255,.9); box-shadow: 0 10px 28px rgba(15, 23, 42, .12); }
+    #tooltip { position: absolute; left: 0; top: 0; max-width: 320px; padding: 7px 9px; border: 1px solid rgba(15,23,42,.14); border-radius: 6px; background: rgba(255,255,255,.96); box-shadow: 0 10px 28px rgba(15,23,42,.16); font-size: 12px; line-height: 1.45; color: #17202a; pointer-events: none; transform: translate(-9999px, -9999px); }
+    aside { overflow: auto; border-left: 1px solid #d7e0ea; background: #fff; padding: 16px; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    h2 { font-size: 15px; margin: 16px 0 6px; }
+    .meta { font-size: 12px; color: #5d6b7a; line-height: 1.5; margin-bottom: 12px; }
+    .legend { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 10px; margin: 10px 0 12px; font-size: 12px; color: #475569; }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+    .swatch { width: 28px; height: 0; border-top: 3px solid #758397; flex: none; }
+    .swatch.current { border-top-color: rgba(14,116,144,.86); }
+    .swatch.missing { border-top-color: rgba(15,23,42,.20); }
+    .swatch.partial { border-top-color: rgba(88,28,135,.36); }
+    .swatch.candidate { border-top-color: rgba(217,119,6,.72); }
+    .swatch.included { border-top-color: rgba(22,128,84,.82); }
+    .swatch.boundary { border-top-color: rgba(220,38,38,.42); }
+    .swatch.gap { width: 11px; height: 11px; border: 2px solid #fff; border-radius: 50%; background: #dc2626; box-shadow: 0 0 0 1px rgba(15,23,42,.2); }
+    .item { border: 1px solid #e1e7ee; border-radius: 6px; padding: 10px; margin: 8px 0; background: #fff; cursor: pointer; }
+    .item.active { border-color: #d97706; box-shadow: 0 0 0 2px rgba(217,119,6,.16); }
+    .code { font-weight: 700; font-family: Consolas, "Microsoft YaHei", monospace; }
+    .small { font-size: 12px; color: #506070; line-height: 1.45; }
+    .detail { min-height: 86px; border: 1px solid #e1e7ee; border-radius: 6px; padding: 10px; background: #f8fafc; font-size: 12px; line-height: 1.55; color: #334155; }
+    button { border: 1px solid #b8c3cf; background: #fff; border-radius: 5px; padding: 5px 8px; margin: 0; cursor: pointer; color: #17202a; }
+    button.active { border-color: #2563eb; background: #eff6ff; color: #1d4ed8; }
+    button:disabled { opacity: .44; cursor: not-allowed; }
+    button.confirm { border-color: #7e22ce; color: #581c87; }
+    button.cancel { border-color: #94a3b8; color: #334155; }
+    button.include { border-color: #168054; color: #0f6844; }
+    button.apply { border-color: #0f766e; color: #0f766e; }
+    button.need { border-color: #1d9a65; color: #0d7048; margin-top: 7px; margin-right: 4px; }
+    button.no { border-color: #d33b3b; color: #a12424; margin-top: 7px; }
+    textarea { width: 100%; min-height: 74px; box-sizing: border-box; font-family: Consolas, monospace; font-size: 12px; margin-top: 8px; border: 1px solid #d6dee8; border-radius: 6px; padding: 8px; resize: vertical; }
+  </style>
+</head>
+<body>
+  <main id="stage">
+    <canvas id="map"></canvas>
+    <div id="toolbar">
+      <button id="zoomOut" type="button">-</button>
+      <button id="resetView" type="button">1:1</button>
+      <button id="zoomIn" type="button">+</button>
+      <button id="modeSelect" type="button">选择</button>
+      <button id="modeLink" type="button">端点修补</button>
+      <button id="modeBan" type="button">禁行框</button>
+      <button id="confirmLink" class="confirm" type="button" disabled>&#x786E;&#x8BA4;&#x8FDE;&#x63A5;</button>
+      <button id="cancelLink" class="cancel" type="button" disabled>&#x53D6;&#x6D88;&#x8FDE;&#x63A5;</button>
+      <button id="confirmReference" class="include" type="button" disabled>&#x786E;&#x8BA4;&#x7EB3;&#x5165;</button>
+      <button id="cancelReference" class="cancel" type="button" disabled>&#x53D6;&#x6D88;&#x5019;&#x9009;</button>
+      <button id="applyIndex" class="apply" type="button">&#x5E94;&#x7528;&#x5230;Index</button>
+      <span class="meta" id="zoomLabel" style="margin:0 0 0 4px;"></span>
+    </div>
+    <div id="tooltip"></div>
+  </main>
+  <aside>
+    <h1>拓扑断点检查</h1>
+    <div class="meta" id="summary"></div>
+    <div class="legend">
+      <span><i class="swatch current"></i>当前闵行图实线</span>
+      <span><i class="swatch missing"></i>上海 PBF 未纳入暗线</span>
+      <span><i class="swatch partial"></i>边界局部重叠</span>
+      <span><i class="swatch boundary"></i>真实闵行边界</span>
+      <span><i class="swatch candidate"></i>候选片段</span>
+      <span><i class="swatch included"></i>确认纳入实线</span>
+      <span><i class="swatch gap"></i>断点</span>
+    </div>
+    <div class="detail" id="details"></div>
+    <div>
+      <button id="clear">清空选择</button>
+      <textarea id="selection" readonly></textarea>
+    </div>
+    <h2>断点</h2>
+    <div id="gaps"></div>
+    <h2>候选片段</h2>
+    <div id="candidates"></div>
+  </aside>
+  <script>
+    const DATA_URL = 'topology-gap-debug.json';
+    document.getElementById('summary').textContent = '正在加载 topology-gap-debug.json ...';
+    fetch(DATA_URL)
+      .then((response) => {
+        if (!response.ok) throw new Error('Cannot load ' + DATA_URL + ': ' + response.status);
+        return response.json();
+      })
+      .then(init)
+      .catch((error) => {
+        document.getElementById('summary').textContent = '数据加载失败：' + error.message;
+        document.getElementById('details').textContent = '请通过本地 HTTP 打开，例如 http://127.0.0.1:5500/test-results/topology-gap-debug.html';
+        console.error(error);
+      });
+
+    function init(data) {
+    const canvas = document.getElementById('map');
+    const ctx = canvas.getContext('2d');
+    const stage = document.getElementById('stage');
+    const tooltip = document.getElementById('tooltip');
+    const details = document.getElementById('details');
+    const zoomLabel = document.getElementById('zoomLabel');
+    const need = new Set();
+    const no = new Set();
+    const includeMissing = new Set();
+    const manualLinks = [];
+    const banAreas = [];
+    const contextRoads = data.contextRoads.slice().sort((a, b) => a.rank - b.rank);
+    const referenceRoads = data.referenceRoads || [];
+    const boundaryRing = data.boundaryRing || [];
+    const allSegments = contextRoads.concat(referenceRoads);
+    const annotationStorageKey = 'topology-gap-debug:annotations:' + (data.pbf || 'default');
+    let applyInFlight = false;
+    let selected = null;
+    let hover = null;
+    let mode = 'select';
+    let pendingReference = null;
+    let pendingEndpoint = null;
+    let draftLink = null;
+    let linkPreviewPoint = null;
+    let draftBan = null;
+    let baseScale = 1;
+    let dpr = 1;
+    const bounds = data.view.bounds;
+    const view = { scale: 1, x: 0, y: 0 };
+    const drag = { active: false, moved: false, x: 0, y: 0 };
+    const referenceAudit = data.summary.referenceAudit || {};
+    document.getElementById('summary').textContent =
+      'GAP ' + data.summary.focusGaps + ' / CAND ' + data.summary.candidates +
+      ' / SH ' + data.summary.referenceRoads +
+      ' / partial ' + (referenceAudit.keptPartialOverlap || 0) +
+      ' / boundary ' + (referenceAudit.keptBoundaryCovered || 0) +
+      ' / covered-skip ' + (referenceAudit.skippedAlreadyRendered || 0) +
+      ' / 当前实线 ' + data.summary.contextRoads +
+      ' / ' + data.pbf;
+
+    function card(container, item, type) {
+      const div = document.createElement('div');
+      div.className = 'item';
+      div.id = 'card-' + item.code;
+      const title = document.createElement('div');
+      title.innerHTML = '<span class="code">' + item.code + '</span> ' + (item.name || (item.names || []).join(' / ') || '');
+      const info = document.createElement('div');
+      info.className = 'small';
+      info.textContent = type === 'gap'
+        ? 'edges=' + item.edgeCount + ' / ' + (item.highways || []).join(', ')
+        : item.highway + ' rank=' + item.rank + ' status=' + item.status + ' / ' + item.reason;
+      div.appendChild(title);
+      div.appendChild(info);
+      if (type === 'candidate') {
+        const needButton = document.createElement('button');
+        needButton.className = 'need';
+        needButton.textContent = '需要';
+        needButton.onclick = () => mark(item.code, 'need');
+        const noButton = document.createElement('button');
+        noButton.className = 'no';
+        noButton.textContent = '不要';
+        noButton.onclick = () => mark(item.code, 'no');
+        div.appendChild(needButton);
+        div.appendChild(noButton);
+      }
+      div.onclick = (event) => {
+        if (event.target.tagName !== 'BUTTON') selectItem({ type, item });
+      };
+      container.appendChild(div);
+    }
+
+    data.gaps.forEach((item) => card(document.getElementById('gaps'), item, 'gap'));
+    data.candidates.forEach((item) => card(document.getElementById('candidates'), item, 'candidate'));
+    document.getElementById('clear').onclick = () => {
+      need.clear();
+      no.clear();
+      includeMissing.clear();
+      manualLinks.length = 0;
+      banAreas.length = 0;
+      pendingReference = null;
+      pendingEndpoint = null;
+      draftLink = null;
+      linkPreviewPoint = null;
+      draftBan = null;
+      clearSavedAnnotations();
+      updateReferenceButtons();
+      updateLinkButtons();
+      updateSelection();
+    };
+    document.getElementById('zoomIn').onclick = () => zoomAtCenter(1.35);
+    document.getElementById('zoomOut').onclick = () => zoomAtCenter(1 / 1.35);
+    document.getElementById('resetView').onclick = fitView;
+    document.getElementById('modeSelect').onclick = () => setMode('select');
+    document.getElementById('modeLink').onclick = () => setMode('link');
+    document.getElementById('modeBan').onclick = () => setMode('ban');
+    document.getElementById('confirmLink').onclick = confirmDraftLink;
+    document.getElementById('cancelLink').onclick = cancelDraftLink;
+    document.getElementById('confirmReference').onclick = confirmReferenceCandidate;
+    document.getElementById('cancelReference').onclick = cancelReferenceCandidate;
+    document.getElementById('applyIndex').onclick = applyAnnotationsToIndex;
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('resize', resize);
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    canvas.addEventListener('pointerdown', handlePointerDown);
+    canvas.addEventListener('pointermove', handlePointerMove);
+    canvas.addEventListener('pointerup', handlePointerUp);
+    canvas.addEventListener('pointerleave', () => {
+      hover = null;
+      if (!draftLink) linkPreviewPoint = null;
+      hideTooltip();
+      draw();
+    });
+
+    function setMode(nextMode) {
+      mode = nextMode;
+      pendingReference = null;
+      pendingEndpoint = null;
+      draftLink = null;
+      linkPreviewPoint = null;
+      draftBan = null;
+      document.getElementById('modeSelect').classList.toggle('active', mode === 'select');
+      document.getElementById('modeLink').classList.toggle('active', mode === 'link');
+      document.getElementById('modeBan').classList.toggle('active', mode === 'ban');
+      updateReferenceButtons();
+      updateLinkButtons();
+      details.textContent = mode === 'link'
+        ? '端点修补：先点第一个端点，再移动或点击第二个端点预览连线；确认后才会写入 MANUAL_LINKS。'
+        : mode === 'ban'
+          ? '禁行框：在地图上拖出矩形，车辆禁入区域会写入标注结果。'
+          : '点击未纳入暗线会先进入实线候选；点“确认纳入”后才写入 INCLUDE_MISSING。hover 可看路名。';
+      draw();
+    }
+
+    function updateLinkButtons() {
+      const hasDraft = Boolean(draftLink);
+      const hasPending = Boolean(pendingEndpoint);
+      document.getElementById('confirmLink').disabled = !hasDraft;
+      document.getElementById('cancelLink').disabled = !(hasDraft || hasPending);
+    }
+
+    function updateReferenceButtons() {
+      document.getElementById('confirmReference').disabled = !pendingReference;
+      document.getElementById('cancelReference').disabled = !pendingReference;
+    }
+
+    function saveAnnotations() {
+      try {
+        localStorage.setItem(annotationStorageKey, JSON.stringify(annotationPayload()));
+      } catch (error) {
+        console.warn('Cannot save topology annotations', error);
+      }
+    }
+
+    function annotationPayload() {
+      const includeItems = Array.from(includeMissing).map((item) => {
+        const road = referenceRoads.find((candidate) => candidate.code === item);
+        return road
+          ? { code: item, osmId: String(road.osmId), segmentIndex: road.segmentIndex }
+          : { code: item };
+      });
+      return {
+        version: 2,
+        savedAt: new Date().toISOString(),
+        pbf: data.pbf,
+        includeMissing: includeItems,
+        candidateAdd: Array.from(need),
+        candidateNo: Array.from(no),
+        manualLinks: manualLinks.slice(),
+        banAreas: banAreas.slice()
+      };
+    }
+
+    function loadSavedAnnotations() {
+      try {
+        const raw = localStorage.getItem(annotationStorageKey);
+        if (!raw) return;
+        const saved = JSON.parse(raw);
+        (saved.candidateAdd || []).forEach((item) => {
+          if (data.candidates.some((candidate) => candidate.code === item)) need.add(item);
+        });
+        (saved.candidateNo || []).forEach((item) => {
+          if (data.candidates.some((candidate) => candidate.code === item)) no.add(item);
+        });
+        (saved.includeMissing || []).forEach((item) => {
+          const resolved = resolveReferenceCode(item);
+          if (resolved) includeMissing.add(resolved);
+        });
+        (saved.manualLinks || []).forEach((link) => {
+          if (link?.from && link?.to && Number.isFinite(link.from.x) && Number.isFinite(link.to.x)) {
+            manualLinks.push({ code: link.code || code('LINK', manualLinks.length), from: link.from, to: link.to });
+          }
+        });
+        (saved.banAreas || []).forEach((area) => {
+          if ([area?.minX, area?.minY, area?.maxX, area?.maxY].every(Number.isFinite)) {
+            banAreas.push({ code: area.code || code('BAN', banAreas.length), minX: area.minX, minY: area.minY, maxX: area.maxX, maxY: area.maxY });
+          }
+        });
+      } catch (error) {
+        console.warn('Cannot restore topology annotations', error);
+      }
+    }
+
+    function resolveReferenceCode(saved) {
+      if (!saved) return '';
+      if (typeof saved === 'string') {
+        return referenceRoads.some((road) => road.code === saved) ? saved : '';
+      }
+      const byCode = referenceRoads.find((road) => road.code === saved.code);
+      if (byCode) return byCode.code;
+      const byOsmSegment = referenceRoads.find((road) => (
+        String(road.osmId) === String(saved.osmId) && Number(road.segmentIndex) === Number(saved.segmentIndex)
+      ));
+      return byOsmSegment?.code || '';
+    }
+
+    function clearSavedAnnotations() {
+      try {
+        localStorage.removeItem(annotationStorageKey);
+      } catch (error) {
+        console.warn('Cannot clear topology annotations', error);
+      }
+    }
+
+    async function applyAnnotationsToIndex() {
+      if (applyInFlight) return;
+      const button = document.getElementById('applyIndex');
+      const previousText = button.textContent;
+      applyInFlight = true;
+      button.disabled = true;
+      button.textContent = '正在应用...';
+      saveAnnotations();
+      try {
+        const payload = annotationPayload();
+        const response = await postAnnotations(payload);
+        details.textContent = '已应用到 Index：写入 ' + response.includeMissing + ' 段纳入路，' + response.manualLinks + ' 条手动连接；总 roads=' + response.roads + '。刷新 index.html 可看到新路网。';
+      } catch (error) {
+        details.textContent = '应用到 Index 失败：' + error.message + '。请用 node tools/topology-gap-annotation-server.mjs 打开带写入能力的本地服务。';
+        console.error(error);
+      } finally {
+        applyInFlight = false;
+        button.disabled = false;
+        button.textContent = previousText;
+      }
+    }
+
+    async function postAnnotations(payload) {
+      const endpoints = [
+        '/api/topology-annotations/apply',
+        'http://127.0.0.1:5510/api/topology-annotations/apply'
+      ];
+      let lastError = null;
+      for (const endpoint of endpoints) {
+        try {
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!response.ok) throw new Error(endpoint + ' HTTP ' + response.status);
+          const result = await response.json();
+          if (!result.ok) throw new Error(result.error || 'apply failed');
+          return result.result;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError || new Error('cannot reach apply API');
+    }
+
+    function mark(code, kind) {
+      if (kind === 'need') {
+        no.delete(code);
+        need.has(code) ? need.delete(code) : need.add(code);
+      } else {
+        need.delete(code);
+        no.has(code) ? no.delete(code) : no.add(code);
+      }
+      updateSelection();
+      const item = data.candidates.find((candidate) => candidate.code === code);
+      if (item) selectItem({ type: 'candidate', item });
+    }
+    function updateSelection() {
+      const includeLines = Array.from(includeMissing)
+        .map((item) => {
+          const road = referenceRoads.find((candidate) => candidate.code === item);
+          return road ? item + ' osm=' + road.osmId + ' seg=' + road.segmentIndex + ' name=' + displayName(road) : item;
+        });
+      const linkLines = manualLinks.map((link) => (
+        link.code + ' ' + link.from.code + ':' + link.from.end + ' -> ' + link.to.code + ':' + link.to.end +
+        ' [' + round(link.from.x, 2) + ',' + round(link.from.y, 2) + '] -> [' + round(link.to.x, 2) + ',' + round(link.to.y, 2) + ']'
+      ));
+      const banLines = banAreas.map((area) => (
+        area.code + ' minX=' + round(area.minX, 2) + ' minY=' + round(area.minY, 2) +
+        ' maxX=' + round(area.maxX, 2) + ' maxY=' + round(area.maxY, 2)
+      ));
+      document.getElementById('selection').value =
+        'INCLUDE_MISSING:\n' + (includeLines.join('\n') || '-') + '\n\n' +
+        'CANDIDATE_ADD: ' + (Array.from(need).join(' ') || '-') + '\n' +
+        'CANDIDATE_NO: ' + (Array.from(no).join(' ') || '-') + '\n\n' +
+        'MANUAL_LINKS:\n' + (linkLines.join('\n') || '-') + '\n\n' +
+        'BAN_AREAS:\n' + (banLines.join('\n') || '-');
+      saveAnnotations();
+      draw();
+    }
+
+    function selectItem(target, options = {}) {
+      selected = target;
+      if (target.type === 'reference' && options.prepareReference !== false) {
+        pendingReference = includeMissing.has(target.item.code) ? null : target.item.code;
+        updateReferenceButtons();
+      } else if (target.type !== 'reference') {
+        pendingReference = null;
+        updateReferenceButtons();
+      }
+      document.querySelectorAll('.item.active').forEach((node) => node.classList.remove('active'));
+      const code = target.item.code;
+      document.getElementById('card-' + code)?.classList.add('active');
+      document.getElementById('card-' + code)?.scrollIntoView({ block: 'nearest' });
+      showDetails(target);
+      draw();
+    }
+
+    function showDetails(target) {
+      const item = target.item;
+      details.textContent = '';
+      const lines = [];
+      if (target.type === 'gap') {
+        lines.push(item.code + '  ' + (item.names || []).join(' / '));
+        lines.push('highway: ' + (item.highways || []).join(', ') + ' / endpoints: ' + item.edgeCount);
+        lines.push('xy: ' + item.x + ', ' + item.y);
+      } else if (target.type === 'endpoint') {
+        lines.push(item.code + ':' + target.end + '  ' + displayName(item));
+        lines.push('endpoint xy: ' + round(target.x, 2) + ', ' + round(target.y, 2));
+        lines.push('OSM way: ' + item.osmId + ' / seg ' + item.segmentIndex + ' / ' + item.highway + ' / ' + item.status);
+        if (draftLink) {
+          lines.push('连接预览已生成：点“确认连接”写入 MANUAL_LINKS，或点“取消连接”重选。');
+        } else if (pendingEndpoint) {
+          lines.push('已选第一个端点：移动到第二个端点会预览连线，点击后再确认。');
+        } else {
+          lines.push('点击这个端点作为起点，然后选第二个端点预览修补连接。');
+        }
+      } else {
+        lines.push(item.code + '  ' + displayName(item));
+        lines.push('OSM way: ' + item.osmId + ' / seg ' + (item.segmentIndex ?? '-') + ' / ' + item.highway + ' / rank ' + item.rank + ' / ' + item.status);
+        if (item.coverageRatio !== undefined) {
+          lines.push('coverage in current: ' + Math.round(item.coverageRatio * 100) + '% / endpoints ' + (item.endpointCoverage ?? 0) + '/2');
+        }
+        if (target.type === 'reference') {
+          if (includeMissing.has(item.code)) {
+            lines.push('已确认纳入：该段以实线样式显示，并写入 INCLUDE_MISSING。');
+          } else if (pendingReference === item.code) {
+            lines.push('已进入实线候选：点“确认纳入”后才会写入 INCLUDE_MISSING，点“取消候选”可撤回。');
+          } else {
+            lines.push('未纳入暗线：点击后先进入实线候选，需再确认才会写入 INCLUDE_MISSING。');
+          }
+        }
+        if (item.layer || item.bridge || item.tunnel) lines.push('layer: ' + item.layer + ' / bridge: ' + (item.bridge || '-') + ' / tunnel: ' + (item.tunnel || '-'));
+        if (item.nearGaps?.length) lines.push('near: ' + item.nearGaps.join(', '));
+        if (item.nodeIds?.length) lines.push('nodes: ' + item.nodeIds.join(' -> '));
+      }
+      lines.forEach((line) => {
+        const div = document.createElement('div');
+        div.textContent = line;
+        details.appendChild(div);
+      });
+    }
+
+    function fitView() {
+      const rect = canvas.getBoundingClientRect();
+      const pad = 26;
+      const width = Math.max(1, bounds.maxX - bounds.minX);
+      const height = Math.max(1, bounds.maxY - bounds.minY);
+      baseScale = Math.min((rect.width - pad * 2) / width, (rect.height - pad * 2) / height);
+      if (!Number.isFinite(baseScale) || baseScale <= 0) baseScale = 1;
+      view.scale = baseScale;
+      view.x = pad - bounds.minX * view.scale + (rect.width - pad * 2 - width * view.scale) / 2;
+      view.y = pad - bounds.minY * view.scale + (rect.height - pad * 2 - height * view.scale) / 2;
+      draw();
+    }
+
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      fitView();
+    }
+
+    function draw() {
+      if (!canvas.width || !canvas.height) return;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#f8fafc';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.setTransform(dpr * view.scale, 0, 0, dpr * view.scale, dpr * view.x, dpr * view.y);
+
+      const visible = visibleWorldBounds();
+      drawGrid(visible);
+      drawBoundaryRing();
+      contextRoads.forEach((road) => {
+        if (boundsOverlap(road.bbox, visible)) drawContextRoad(road);
+      });
+      referenceRoads.forEach((road) => {
+        if (boundsOverlap(road.bbox, visible)) drawReferenceRoad(road);
+      });
+      data.candidates.forEach(drawCandidate);
+      drawManualLinks();
+      drawDraftLink();
+      drawBanAreas();
+      if (mode === 'link' && view.scale / baseScale >= 2.2) drawEndpoints(visible);
+      if (draftBan) drawBanRect(draftBan, true);
+      data.gaps.forEach(drawGap);
+      if (hover) drawTarget(hover, '#0ea5e9', 4.6, false);
+      if (selected) drawTarget(selected, '#f59e0b', 5.8, true);
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      zoomLabel.textContent = Math.round(view.scale / baseScale * 100) + '%';
+    }
+
+    function drawGrid(visible) {
+      const step = 100;
+      ctx.strokeStyle = 'rgba(148,163,184,.18)';
+      ctx.lineWidth = 1 / view.scale;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      for (let x = Math.floor(visible.minX / step) * step; x <= visible.maxX; x += step) {
+        ctx.moveTo(x, visible.minY);
+        ctx.lineTo(x, visible.maxY);
+      }
+      for (let y = Math.floor(visible.minY / step) * step; y <= visible.maxY; y += step) {
+        ctx.moveTo(visible.minX, y);
+        ctx.lineTo(visible.maxX, y);
+      }
+      ctx.stroke();
+    }
+
+    function drawBoundaryRing() {
+      if (boundaryRing.length < 2) return;
+      ctx.setLineDash([]);
+      ctx.strokeStyle = 'rgba(220,38,38,.36)';
+      ctx.lineWidth = 1.25 / view.scale;
+      strokePolyline(boundaryRing);
+    }
+
+    function drawContextRoad(road) {
+      const width = road.rank >= 8 ? 2.35 : road.rank >= 6 ? 1.75 : 1.12;
+      ctx.setLineDash([]);
+      ctx.strokeStyle = 'rgba(255,255,255,.78)';
+      ctx.lineWidth = (width + 1.6) / view.scale;
+      strokePolyline(road.points);
+      ctx.strokeStyle = road.supplemental
+        ? 'rgba(14,116,144,.72)'
+        : road.rank >= 7 ? 'rgba(13,148,136,.86)' : 'rgba(37,99,235,.66)';
+      ctx.lineWidth = width / view.scale;
+      strokePolyline(road.points);
+    }
+
+    function drawReferenceRoad(road) {
+      const included = includeMissing.has(road.code);
+      const pending = pendingReference === road.code;
+      ctx.strokeStyle = included
+        ? 'rgba(22,128,84,.86)'
+        : pending ? 'rgba(217,119,6,.92)'
+          : road.status === 'same-osm-way-partial-overlap' ? 'rgba(88,28,135,.36)'
+          : road.status === 'same-osm-way-boundary-covered' ? 'rgba(88,28,135,.24)'
+          : road.status === 'same-osm-way-missing-part' ? 'rgba(15,23,42,.30)' : 'rgba(15,23,42,.16)';
+      ctx.lineWidth = (included ? 3 : pending ? 3.2 : road.status === 'same-osm-way-partial-overlap' ? 1.55 : road.status === 'same-osm-way-boundary-covered' ? 1.2 : road.rank >= 7 ? 1.35 : .82) / view.scale;
+      ctx.setLineDash([]);
+      strokePolyline(road.points);
+    }
+
+    function drawCandidate(candidate) {
+      ctx.strokeStyle = no.has(candidate.code) ? 'rgba(185,28,28,.9)' : need.has(candidate.code) ? 'rgba(22,128,84,.92)' : 'rgba(217,119,6,.82)';
+      ctx.lineWidth = (need.has(candidate.code) || no.has(candidate.code) ? 3.5 : 2.6) / view.scale;
+      ctx.setLineDash([]);
+      strokePolyline(candidate.points);
+      drawLabel(candidate.code, candidate.points[Math.floor(candidate.points.length / 2)], '#78350f');
+    }
+
+    function drawGap(gap) {
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#dc2626';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2 / view.scale;
+      ctx.beginPath();
+      ctx.arc(gap.x, gap.y, 5.7 / view.scale, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      drawLabel(gap.code, [gap.x + 7 / view.scale, gap.y - 7 / view.scale], '#7f1d1d');
+    }
+
+    function drawManualLinks() {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = 'rgba(126,34,206,.9)';
+      ctx.lineWidth = 3 / view.scale;
+      manualLinks.forEach((link) => {
+        ctx.beginPath();
+        ctx.moveTo(link.from.x, link.from.y);
+        ctx.lineTo(link.to.x, link.to.y);
+        ctx.stroke();
+        drawLabel(link.code, [(link.from.x + link.to.x) / 2, (link.from.y + link.to.y) / 2], '#581c87');
+      });
+    }
+
+    function drawDraftLink() {
+      if (!pendingEndpoint && !draftLink) return;
+      const from = draftLink ? draftLink.from : pendingEndpoint;
+      const to = draftLink ? draftLink.to : linkPreviewPoint;
+      if (!from || !to) return;
+      ctx.setLineDash([]);
+      ctx.strokeStyle = draftLink ? 'rgba(126,34,206,.92)' : 'rgba(126,34,206,.48)';
+      ctx.lineWidth = (draftLink ? 3.6 : 2.2) / view.scale;
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+
+      ctx.fillStyle = '#7e22ce';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.6 / view.scale;
+      ctx.beginPath();
+      ctx.arc(from.x, from.y, 5.4 / view.scale, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = draftLink ? '#f59e0b' : 'rgba(245,158,11,.72)';
+      ctx.beginPath();
+      ctx.arc(to.x, to.y, 5.4 / view.scale, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      if (draftLink) drawLabel('PREVIEW', [(from.x + to.x) / 2, (from.y + to.y) / 2], '#581c87');
+    }
+
+    function drawBanAreas() {
+      banAreas.forEach((area) => drawBanRect(area, false));
+    }
+
+    function drawBanRect(area, draft) {
+      ctx.setLineDash([]);
+      ctx.fillStyle = draft ? 'rgba(220,38,38,.08)' : 'rgba(220,38,38,.13)';
+      ctx.strokeStyle = draft ? 'rgba(220,38,38,.75)' : 'rgba(185,28,28,.9)';
+      ctx.lineWidth = 2 / view.scale;
+      const x = Math.min(area.minX, area.maxX);
+      const y = Math.min(area.minY, area.maxY);
+      const w = Math.abs(area.maxX - area.minX);
+      const h = Math.abs(area.maxY - area.minY);
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeRect(x, y, w, h);
+      if (area.code) drawLabel(area.code, [x + 4 / view.scale, y - 4 / view.scale], '#7f1d1d');
+    }
+
+    function drawEndpoints(visible) {
+      ctx.setLineDash([]);
+      allSegments.forEach((segment) => {
+        if (!boundsOverlap(segment.bbox, visible)) return;
+        segment.points.forEach((point) => {
+          ctx.fillStyle = segment.source === 'shanghai-pbf-missing' ? 'rgba(15,23,42,.45)' : 'rgba(37,99,235,.5)';
+          ctx.beginPath();
+          ctx.arc(point[0], point[1], 2.4 / view.scale, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      });
+      if (pendingEndpoint) {
+        ctx.strokeStyle = '#7e22ce';
+        ctx.lineWidth = 2 / view.scale;
+        ctx.beginPath();
+        ctx.arc(pendingEndpoint.x, pendingEndpoint.y, 7 / view.scale, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    function drawTarget(target, color, width, solid) {
+      const item = target.item;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width / view.scale;
+      ctx.setLineDash([]);
+      if (target.type === 'gap') {
+        ctx.beginPath();
+        ctx.arc(item.x, item.y, 10 / view.scale, 0, Math.PI * 2);
+        ctx.stroke();
+      } else if (target.type === 'endpoint') {
+        ctx.beginPath();
+        ctx.arc(target.x, target.y, 7 / view.scale, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        strokePolyline(item.points);
+      }
+    }
+
+    function drawLabel(text, point, color) {
+      ctx.save();
+      ctx.setLineDash([]);
+      ctx.font = (12 / view.scale) + 'px Consolas, Microsoft YaHei, sans-serif';
+      ctx.lineWidth = 4 / view.scale;
+      ctx.strokeStyle = 'rgba(255,255,255,.92)';
+      ctx.fillStyle = color;
+      ctx.strokeText(text, point[0] + 5 / view.scale, point[1] - 5 / view.scale);
+      ctx.fillText(text, point[0] + 5 / view.scale, point[1] - 5 / view.scale);
+      ctx.restore();
+    }
+
+    function strokePolyline(points) {
+      if (!points || points.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(points[0][0], points[0][1]);
+      for (let index = 1; index < points.length; index += 1) {
+        ctx.lineTo(points[index][0], points[index][1]);
+      }
+      ctx.stroke();
+    }
+
+    function handleWheel(event) {
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const screen = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      const factor = Math.exp(-event.deltaY * 0.0012);
+      zoomAt(screen, factor);
+    }
+
+    function zoomAtCenter(factor) {
+      const rect = canvas.getBoundingClientRect();
+      zoomAt({ x: rect.width / 2, y: rect.height / 2 }, factor);
+    }
+
+    function zoomAt(screen, factor) {
+      const before = screenToWorld(screen);
+      const minScale = baseScale * 0.25;
+      const maxScale = baseScale * 45;
+      view.scale = Math.max(minScale, Math.min(maxScale, view.scale * factor));
+      view.x = screen.x - before.x * view.scale;
+      view.y = screen.y - before.y * view.scale;
+      draw();
+    }
+
+    function handlePointerDown(event) {
+      canvas.setPointerCapture(event.pointerId);
+      const screen = eventToScreen(event);
+      const world = screenToWorld(screen);
+      if (mode === 'ban') {
+        draftBan = { minX: world.x, minY: world.y, maxX: world.x, maxY: world.y };
+        drag.active = true;
+        drag.moved = false;
+        drag.x = event.clientX;
+        drag.y = event.clientY;
+        return;
+      }
+      if (mode === 'link') {
+        drag.active = true;
+        drag.moved = false;
+        drag.x = event.clientX;
+        drag.y = event.clientY;
+        return;
+      }
+      drag.active = true;
+      drag.moved = false;
+      drag.x = event.clientX;
+      drag.y = event.clientY;
+      canvas.classList.add('dragging');
+    }
+
+    function handlePointerMove(event) {
+      const screen = eventToScreen(event);
+      const world = screenToWorld(screen);
+      if (mode === 'ban') {
+        if (drag.active && draftBan) {
+          draftBan.maxX = world.x;
+          draftBan.maxY = world.y;
+          drag.moved = true;
+        }
+        hover = null;
+        hideTooltip();
+        draw();
+        return;
+      }
+      if (mode === 'link') {
+        hover = hitTestEndpoint(world) || hitTest(world);
+        if (pendingEndpoint && !draftLink) {
+          linkPreviewPoint = hover?.type === 'endpoint'
+            ? endpointSummary(hover)
+            : { x: world.x, y: world.y };
+        }
+        showTooltip(hover, screen);
+        draw();
+        return;
+      }
+      if (drag.active) {
+        const dx = event.clientX - drag.x;
+        const dy = event.clientY - drag.y;
+        if (Math.abs(dx) + Math.abs(dy) > 1) drag.moved = true;
+        view.x += dx;
+        view.y += dy;
+        drag.x = event.clientX;
+        drag.y = event.clientY;
+        draw();
+        return;
+      }
+      hover = hitTest(world);
+      showTooltip(hover, screen);
+      draw();
+    }
+
+    function handlePointerUp(event) {
+      canvas.releasePointerCapture(event.pointerId);
+      canvas.classList.remove('dragging');
+      const wasDrag = drag.moved;
+      drag.active = false;
+      const screen = eventToScreen(event);
+      const world = screenToWorld(screen);
+      if (mode === 'ban') {
+        if (draftBan) {
+          draftBan.maxX = world.x;
+          draftBan.maxY = world.y;
+          const area = normalizeArea(draftBan);
+          if (Math.abs(area.maxX - area.minX) > 3 && Math.abs(area.maxY - area.minY) > 3) {
+            banAreas.push({ code: code('BAN', banAreas.length), ...area });
+            updateSelection();
+          }
+        }
+        draftBan = null;
+        draw();
+        return;
+      }
+      if (mode === 'link') {
+        const endpoint = hitTestEndpoint(world);
+        if (endpoint) selectEndpoint(endpoint);
+        return;
+      }
+      if (!wasDrag) {
+        hover = hitTest(world);
+        if (hover) selectItem(hover, { prepareReference: hover.type === 'reference' });
+      }
+    }
+
+    function selectEndpoint(endpoint) {
+      selected = endpoint;
+      if (!pendingEndpoint) {
+        pendingEndpoint = endpoint;
+        draftLink = null;
+        linkPreviewPoint = endpointSummary(endpoint);
+        updateLinkButtons();
+        showDetails(endpoint);
+        draw();
+        return;
+      }
+      const sameEndpoint = pendingEndpoint.item.code === endpoint.item.code && pendingEndpoint.end === endpoint.end;
+      if (sameEndpoint) {
+        cancelDraftLink();
+        return;
+      }
+      draftLink = {
+        from: endpointSummary(pendingEndpoint),
+        to: endpointSummary(endpoint)
+      };
+      linkPreviewPoint = draftLink.to;
+      updateLinkButtons();
+      showDraftLinkDetails();
+      draw();
+    }
+
+    function confirmDraftLink() {
+      if (!draftLink) return;
+      manualLinks.push({
+        code: code('LINK', manualLinks.length),
+        from: draftLink.from,
+        to: draftLink.to
+      });
+      const added = manualLinks[manualLinks.length - 1];
+      pendingEndpoint = null;
+      draftLink = null;
+      linkPreviewPoint = null;
+      updateLinkButtons();
+      updateSelection();
+      details.textContent = '已写入 MANUAL_LINKS：' + added.code + ' ' + added.from.code + ':' + added.from.end + ' -> ' + added.to.code + ':' + added.to.end;
+      draw();
+    }
+
+    function cancelDraftLink() {
+      pendingEndpoint = null;
+      draftLink = null;
+      linkPreviewPoint = null;
+      selected = null;
+      updateLinkButtons();
+      details.textContent = '已取消端点修补，可重新选择第一个端点。';
+      draw();
+    }
+
+    function confirmReferenceCandidate() {
+      if (!pendingReference) return;
+      includeMissing.add(pendingReference);
+      const road = referenceRoads.find((item) => item.code === pendingReference);
+      pendingReference = null;
+      updateReferenceButtons();
+      updateSelection();
+      if (road) {
+        selected = { type: 'reference', item: road };
+        showDetails(selected);
+      }
+      draw();
+    }
+
+    function cancelReferenceCandidate() {
+      pendingReference = null;
+      updateReferenceButtons();
+      if (selected?.type === 'reference') showDetails(selected);
+      draw();
+    }
+
+    function showDraftLinkDetails() {
+      details.textContent = '';
+      [
+        '连接预览',
+        draftLink.from.code + ':' + draftLink.from.end + ' -> ' + draftLink.to.code + ':' + draftLink.to.end,
+        '[' + round(draftLink.from.x, 2) + ',' + round(draftLink.from.y, 2) + '] -> [' + round(draftLink.to.x, 2) + ',' + round(draftLink.to.y, 2) + ']',
+        '点“确认连接”后才会写入 MANUAL_LINKS。'
+      ].forEach((line) => {
+        const div = document.createElement('div');
+        div.textContent = line;
+        details.appendChild(div);
+      });
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === 'Enter' && pendingReference) {
+        event.preventDefault();
+        confirmReferenceCandidate();
+        return;
+      }
+      if (event.key === 'Escape' && pendingReference) {
+        event.preventDefault();
+        cancelReferenceCandidate();
+        return;
+      }
+      if (mode !== 'link') return;
+      if (event.key === 'Enter' && draftLink) {
+        event.preventDefault();
+        confirmDraftLink();
+      } else if (event.key === 'Escape' && (draftLink || pendingEndpoint)) {
+        event.preventDefault();
+        cancelDraftLink();
+      }
+    }
+
+    function endpointSummary(endpoint) {
+      return {
+        code: endpoint.item.code,
+        source: endpoint.item.source,
+        osmId: endpoint.item.osmId,
+        segmentIndex: endpoint.item.segmentIndex,
+        end: endpoint.end,
+        nodeId: endpoint.nodeId || '',
+        highway: endpoint.item.highway || '',
+        rank: endpoint.item.rank || 0,
+        layer: endpoint.item.layer || 0,
+        bridge: endpoint.item.bridge || '',
+        tunnel: endpoint.item.tunnel || '',
+        x: endpoint.x,
+        y: endpoint.y
+      };
+    }
+
+    function hitTest(point) {
+      const threshold = 7 / view.scale;
+      let best = null;
+      function consider(type, item, distance) {
+        if (distance > threshold) return;
+        if (!best || distance < best.distance) best = { type, item, distance };
+      }
+      data.gaps.forEach((gap) => consider('gap', gap, distancePoint(point, [gap.x, gap.y])));
+      data.candidates.forEach((item) => {
+        if (pointNearBounds(point, item.bbox, threshold)) consider('candidate', item, distanceToPolyline(point, item.points));
+      });
+      referenceRoads.forEach((item) => {
+        if (pointNearBounds(point, item.bbox, threshold)) consider('reference', item, distanceToPolyline(point, item.points));
+      });
+      if (!best) {
+        contextRoads.forEach((item) => {
+          if (pointNearBounds(point, item.bbox, threshold)) consider('context', item, distanceToPolyline(point, item.points));
+        });
+      }
+      return best;
+    }
+
+    function hitTestEndpoint(point) {
+      const threshold = 8 / view.scale;
+      let best = null;
+      allSegments.forEach((item) => {
+        if (!pointNearBounds(point, item.bbox, threshold)) return;
+        item.points.forEach((endpoint, index) => {
+          const distance = distancePoint(point, endpoint);
+          if (distance > threshold) return;
+          if (!best || distance < best.distance) {
+            best = {
+              type: 'endpoint',
+              item,
+              end: index === 0 ? 'A' : 'B',
+              nodeId: item.nodeIds?.[index] || '',
+              x: endpoint[0],
+              y: endpoint[1],
+              distance
+            };
+          }
+        });
+      });
+      return best;
+    }
+
+    function showTooltip(target, screen) {
+      if (!target) {
+        hideTooltip();
+        return;
+      }
+      const item = target.item;
+      const label = target.type === 'gap'
+        ? item.code + ' ' + (item.names || []).join(' / ')
+        : target.type === 'endpoint'
+          ? item.code + ':' + target.end + ' ' + displayName(item)
+        : item.code + ' ' + displayName(item);
+      const extra = target.type === 'gap'
+        ? (item.highways || []).join(', ') + ' / endpoints ' + item.edgeCount
+        : target.type === 'endpoint'
+          ? 'endpoint ' + round(target.x, 2) + ', ' + round(target.y, 2)
+        : item.highway + ' rank ' + item.rank + ' / ' + item.status;
+      tooltip.innerHTML = '<strong>' + escapeText(label) + '</strong><br>' + escapeText(extra);
+      tooltip.style.transform = 'translate(' + Math.round(screen.x + 14) + 'px, ' + Math.round(screen.y + 14) + 'px)';
+    }
+
+    function hideTooltip() {
+      tooltip.style.transform = 'translate(-9999px, -9999px)';
+    }
+
+    function screenToWorld(point) {
+      return {
+        x: (point.x - view.x) / view.scale,
+        y: (point.y - view.y) / view.scale
+      };
+    }
+
+    function eventToScreen(event) {
+      const rect = canvas.getBoundingClientRect();
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    }
+
+    function visibleWorldBounds() {
+      const rect = canvas.getBoundingClientRect();
+      const topLeft = screenToWorld({ x: 0, y: 0 });
+      const bottomRight = screenToWorld({ x: rect.width, y: rect.height });
+      return {
+        minX: Math.min(topLeft.x, bottomRight.x),
+        minY: Math.min(topLeft.y, bottomRight.y),
+        maxX: Math.max(topLeft.x, bottomRight.x),
+        maxY: Math.max(topLeft.y, bottomRight.y)
+      };
+    }
+
+    function normalizeArea(area) {
+      return {
+        minX: Math.min(area.minX, area.maxX),
+        minY: Math.min(area.minY, area.maxY),
+        maxX: Math.max(area.minX, area.maxX),
+        maxY: Math.max(area.minY, area.maxY)
+      };
+    }
+
+    function pointNearBounds(point, bbox, pad) {
+      if (!bbox) return true;
+      return point.x >= bbox.minX - pad
+        && point.x <= bbox.maxX + pad
+        && point.y >= bbox.minY - pad
+        && point.y <= bbox.maxY + pad;
+    }
+
+    function boundsOverlap(first, second) {
+      return first.minX <= second.maxX
+        && first.maxX >= second.minX
+        && first.minY <= second.maxY
+        && first.maxY >= second.minY;
+    }
+
+    function round(value, digits = 2) {
+      const factor = Math.pow(10, digits);
+      return Math.round(value * factor) / factor;
+    }
+
+    function displayName(item) {
+      return item.name || '(未命名道路)';
+    }
+
+    function distanceToPolyline(point, points) {
+      if (!points || points.length < 2) return Infinity;
+      let best = Infinity;
+      for (let index = 0; index < points.length - 1; index += 1) {
+        best = Math.min(best, pointToSegmentDistance(point, points[index], points[index + 1]));
+      }
+      return best;
+    }
+
+    function pointToSegmentDistance(point, start, end) {
+      const dx = end[0] - start[0];
+      const dy = end[1] - start[1];
+      const lengthSq = dx * dx + dy * dy;
+      if (!lengthSq) return distancePoint(point, start);
+      const t = Math.max(0, Math.min(1, ((point.x - start[0]) * dx + (point.y - start[1]) * dy) / lengthSq));
+      return distancePoint(point, [start[0] + dx * t, start[1] + dy * t]);
+    }
+
+    function distancePoint(first, second) {
+      const x = Array.isArray(first) ? first[0] : first.x;
+      const y = Array.isArray(first) ? first[1] : first.y;
+      return Math.hypot(x - second[0], y - second[1]);
+    }
+
+    function escapeText(value) {
+      return String(value).replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      })[char]);
+    }
+
+    loadSavedAnnotations();
+    setMode('select');
+    updateSelection();
+    resize();
+    }
+  </script>
+</body>
+</html>

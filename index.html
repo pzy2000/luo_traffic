@@ -2287,8 +2287,8 @@
         vehicle.trail = [];
         vehicle.samples = [];
         vehicle.nextRoutePlanAt = timestamp + 18000 + rng() * 6000;
-        vehicle.spawnGraceUntil = timestamp + 1200;
-        vehicle.exitAllowedAt = timestamp + 0;
+        vehicle.spawnGraceUntil = timestamp + 3200;
+        vehicle.exitAllowedAt = timestamp + 8500 + rng() * 4500;
         vehicle.lastDecision = "preset-through";
         return true;
       }
@@ -2299,7 +2299,7 @@
         }
         const routeLength = Math.max(1, route.length || route.edges.reduce((sum, edge) => sum + (edge.length || 0), 0));
         const phase = options.initial
-          ? 0.1 + (((sequence || 0) * 0.38196601125) % 1) * 0.78
+          ? 0.015 + (((sequence || 0) * 0.38196601125) % 1) * 0.055
           : 0.015 + rng() * 0.055;
         const targetDistance = Math.max(0, Math.min(routeLength - 1, routeLength * phase));
         let remaining = targetDistance;
@@ -2343,15 +2343,6 @@
         const initialEdges = graph.adjacency.get(seedNode) || [];
         let candidates = preferRealTrafficEdges(filterDeadEndCandidates(graph, initialEdges));
         candidates = avoidInternalDetailCandidates(candidates);
-        if (!candidates.length) {
-          candidates = preferRealTrafficEdges(initialEdges);
-          candidates = avoidInternalDetailCandidates(candidates);
-        }
-        if (!candidates.length) {
-          const fallback = Array.from(graph.adjacency.entries())
-            .find((entry) => isUsableTrafficNode(graph, entry[0]) && filterDeadEndCandidates(graph, entry[1]).length);
-          candidates = fallback ? preferRealTrafficEdges(filterDeadEndCandidates(graph, fallback[1])) : [];
-        }
         if (!candidates.length) {
           return null;
         }
@@ -2426,7 +2417,7 @@
             available.splice(index, 1);
           }
         }
-        return fallback || weightedChoice(weighted);
+        return fallback && hasCachedForwardPathAfterEdge(graph, fallback) ? fallback : null;
       }
 
       function chooseThroughBoundaryEdge(graph, salt) {
@@ -2463,14 +2454,14 @@
         if (!candidates.length) {
           return null;
         }
-        return weightedChoice(candidates.map((edge) => ({
+        return chooseForwardSafeWeightedEdge(graph, candidates.map((edge) => ({
           item: edge,
           weight: roadPreference(edge)
             * Math.max(1, edge.length)
             * (edge.rank >= 8 ? 4.8 : edge.rank >= 7 ? 2.8 : 1)
             * (1.1 + edgeVerticalness(edge) * 2.4)
             * edgeSpawnSpreadWeight(graph, edge, targetX, preferNorthToSouth ? roadBounds.minY : roadBounds.maxY)
-        })));
+        })), 8);
       }
 
       function respawnTrafficVehicle(vehicle, timestamp = performance.now()) {
@@ -2547,13 +2538,13 @@
         }
         const fallback = collectMainRoadSpawnCandidates(graph, 6);
         if (!fallback.length) return null;
-        return weightedChoice(fallback.map((edge) => ({
+        return chooseForwardSafeWeightedEdge(graph, fallback.map((edge) => ({
           item: edge,
           weight: roadPreference(edge)
             * (edge.rank >= 8 ? 4 : edge.rank >= 7 ? 2.5 : 1)
             * Math.max(1, edge.length)
             * (isCrowdedNorthwestHorizontalEdge(graph, edge) ? 0.03 : 1)
-        })));
+        })), 8);
       }
 
       function chooseDistributedThroughEdge(graph, salt) {
@@ -2579,14 +2570,14 @@
           return mid && Math.abs(mid.nx - zone.x) <= 0.24 && Math.abs(mid.ny - zone.y) <= 0.26;
         });
         const pool = zoneCandidates.length >= 3 ? zoneCandidates : candidates;
-        return weightedChoice(pool.map((edge) => ({
+        return chooseForwardSafeWeightedEdge(graph, pool.map((edge) => ({
           item: edge,
           weight: roadPreference(edge)
             * Math.max(1, edge.length)
             * (edge.rank >= 9 ? 5.2 : 3.4)
             * (1.2 + edgeVerticalness(edge) * 2.8)
             * edgeSpawnSpreadWeight(graph, edge, zone.worldX, zone.worldY)
-        })));
+        })), 8);
       }
 
       function throughSpawnZoneForSalt(salt) {
@@ -2619,7 +2610,7 @@
           return Math.abs(mid.nx - zone.x) <= 0.22 && Math.abs(mid.ny - zone.y) <= 0.24;
         });
         const pool = zoneCandidates.length >= 4 ? zoneCandidates : candidates;
-        return weightedChoice(pool.map((edge) => {
+        return chooseForwardSafeWeightedEdge(graph, pool.map((edge) => {
           const mid = edgeMidpoint(graph, edge);
           const spread = mid ? edgeSpawnSpreadWeight(graph, edge, zone.worldX, zone.worldY) : 1;
           const northwestPenalty = isCrowdedNorthwestHorizontalEdge(graph, edge) ? 0.02 : 1;
@@ -2631,7 +2622,7 @@
               * spread
               * northwestPenalty
           };
-        }));
+        }), 8);
       }
 
       function collectMainRoadSpawnCandidates(graph, minRank) {
@@ -2645,7 +2636,7 @@
           if (!isCruiseTrafficEdge(graph, edge) || !isDriveCoreNode(graph, edge.from) || !isDriveCoreNode(graph, edge.to)) {
             return false;
           }
-          return graph.precomputed ? hasImmediateForwardExit(graph, edge) : hasCachedForwardPathAfterEdge(graph, edge);
+          return hasImmediateForwardExit(graph, edge);
         });
       }
 
@@ -2936,12 +2927,15 @@
           if (!nextEdge) {
             vehicle.position = sampleEdge(vehicle.currentEdge, vehicle.edgeProgress);
             vehicle.lastDecision = "dead-end-retire";
-            if (isBoundaryDeadEndNode(routeLibrary.graph, arrivalNode, incomingEdge) && startExitVanish(vehicle, timestamp, "dead-end-boundary")) {
+            if (isBoundaryDeadEndNode(routeLibrary.graph, arrivalNode, incomingEdge)
+              && shouldExitAtBoundaryDeadEnd(vehicle, timestamp)
+              && startExitVanish(vehicle, timestamp, "dead-end-boundary")) {
               remaining = 0;
               break;
             }
             if (!startParkVanish(vehicle, timestamp, "dead-end-interior")) {
               requestVehicleRetire(vehicle, timestamp, "dead-end-interior");
+              holdVehicleAtDeadEnd(vehicle, timestamp);
             }
             remaining = 0;
             break;
@@ -3092,6 +3086,9 @@
         if (vehicle.fixedThrough && !isFixedThroughExitReady(vehicle, 24)) {
           return false;
         }
+        if (vehicle.destinationKind === "outside" && vehicle.targetNode && !isDestinationExitReady(vehicle, 72)) {
+          return false;
+        }
         return isBoundaryExitCandidate(vehicle, 110, false);
       }
 
@@ -3106,6 +3103,9 @@
           return false;
         }
         if (vehicle.fixedThrough && !isFixedThroughExitReady(vehicle, 24)) {
+          return false;
+        }
+        if (vehicle.destinationKind === "outside" && vehicle.targetNode && !isDestinationExitReady(vehicle, 96)) {
           return false;
         }
         return isBoundaryExitCandidate(vehicle, vehicle.strategy === "through" ? 210 : 110, true);
@@ -3136,6 +3136,22 @@
           return progressRatio > 0.5 && movingOutward;
         }
         return progressRatio > 0.48 && (movingOutward || endNearBoundary);
+      }
+
+      function shouldExitAtBoundaryDeadEnd(vehicle, timestamp) {
+        if (vehicle.retireIntent) {
+          return true;
+        }
+        if (vehicle.destinationKind !== "outside") {
+          return false;
+        }
+        if (timestamp < Math.max(vehicle.spawnGraceUntil || 0, vehicle.exitAllowedAt || 0)) {
+          return false;
+        }
+        if (vehicle.fixedThrough) {
+          return isFixedThroughExitReady(vehicle, 32);
+        }
+        return !vehicle.targetNode || isDestinationExitReady(vehicle, 120);
       }
 
       function nearestMapBoundary(point) {
@@ -3196,6 +3212,29 @@
         return currentRemaining + (vehicle.plannedEdges || []).reduce((sum, edge) => sum + (edge.length || 0), 0);
       }
 
+      function isDestinationExitReady(vehicle, maxRemainingDistance) {
+        const targetNode = vehicle.targetNode ? routeLibrary.graph.nodes.get(vehicle.targetNode) : null;
+        if (!targetNode || !vehicle.position) {
+          return false;
+        }
+        if (distance(vehicle.position, targetNode) <= maxRemainingDistance) {
+          return true;
+        }
+        if (vehicle.currentEdge && vehicle.currentEdge.to === vehicle.targetNode) {
+          const progressRatio = vehicle.edgeProgress / Math.max(1, vehicle.currentEdge.length || 1);
+          return progressRatio > 0.42;
+        }
+        return vehicleRemainingPlannedDistance(vehicle) <= maxRemainingDistance;
+      }
+
+      function vehicleRemainingPlannedDistance(vehicle) {
+        if (!vehicle.currentEdge) {
+          return Infinity;
+        }
+        const currentRemaining = Math.max(0, (vehicle.currentEdge.length || 0) - (vehicle.edgeProgress || 0));
+        return currentRemaining + (vehicle.plannedEdges || []).reduce((sum, edge) => sum + (edge.length || 0), 0);
+      }
+
       function startParkVanish(vehicle, timestamp, reason) {
         if (!canStopOrParkOnEdge(vehicle.currentEdge)) {
           vehicle.lastDecision = "park-denied-main-road";
@@ -3221,18 +3260,51 @@
         return startParkVanish(vehicle, timestamp, reason);
       }
 
+      function startForcedRetireVanish(vehicle, timestamp, reason) {
+        if (vehicle.vanish) {
+          return true;
+        }
+        if (vehicle.currentEdge && !vehicle.position) {
+          vehicle.position = sampleEdge(vehicle.currentEdge, vehicle.edgeProgress);
+        }
+        vehicle.vanish = {
+          kind: "retire",
+          reason,
+          start: timestamp,
+          duration: 760 + rng() * 360
+        };
+        vehicle.retireIntent = null;
+        vehicle.plannedEdges = [];
+        vehicle.speed = 0;
+        vehicle.stopUntil = 0;
+        vehicle.slowUntil = 0;
+        vehicle.samples = [];
+        vehicle.lastDecision = "forced-retire";
+        return true;
+      }
+
       function requestVehicleRetire(vehicle, timestamp, reason) {
         if (!vehicle.retireIntent) {
+          const urgentDeadEnd = typeof reason === "string" && reason.startsWith("dead-end");
           vehicle.retireIntent = {
             reason,
             start: timestamp,
-            expires: timestamp + 24000 + rng() * 16000
+            expires: timestamp + 24000 + rng() * 16000,
+            forceAt: urgentDeadEnd ? timestamp + 1800 + rng() * 1400 : null
           };
         }
         vehicle.plannedEdges = [];
         if (vehicle.currentEdge && vehicle.currentEdge.rank >= 7 && (vehicle.mainRoadDistanceRemaining || 0) < 120) {
           vehicle.mainRoadDistanceRemaining = 120 + rng() * 180;
         }
+      }
+
+      function holdVehicleAtDeadEnd(vehicle, timestamp) {
+        vehicle.speed = 0;
+        vehicle.slowUntil = 0;
+        vehicle.turnSlowdownUntil = 0;
+        vehicle.stopUntil = Math.max(vehicle.stopUntil || 0, timestamp + 900);
+        vehicle.samples = [];
       }
 
       function maybeStartRetireVanish(vehicle, timestamp) {
@@ -3248,6 +3320,9 @@
         if (timestamp > vehicle.retireIntent.expires && vehicle.currentEdge && canStopOrParkOnEdge(vehicle.currentEdge)) {
           return startParkVanish(vehicle, timestamp, vehicle.retireIntent.reason);
         }
+        if (vehicle.retireIntent.forceAt && timestamp > vehicle.retireIntent.forceAt) {
+          return startForcedRetireVanish(vehicle, timestamp, vehicle.retireIntent.reason);
+        }
         return false;
       }
 
@@ -3260,12 +3335,18 @@
       }
 
       function canStopOrParkOnEdge(edge) {
-        return Boolean(edge
-          && isSideRoadEdge(edge)
-          && !isElevatedOrExpressway(edge)
-          && !isLinkEdge(edge)
-          && edge.highway !== "motorway"
-          && edge.highway !== "trunk");
+        if (!edge
+          || isElevatedOrExpressway(edge)
+          || isLinkEdge(edge)
+          || edge.highway === "motorway"
+          || edge.highway === "trunk") {
+          return false;
+        }
+        const road = roadLookup.get(String(edge.roadId));
+        if (road && ["private", "no"].includes(road.access || "")) {
+          return false;
+        }
+        return isSideRoadEdge(edge) || (edge.highway === "residential" && edge.rank >= 2);
       }
 
       function isSideRoadEdge(edge) {
@@ -3477,6 +3558,13 @@
             .filter((edge) => edge.to !== previousNode || legalOutgoing.length === 1);
           if (safeOutgoing.length) {
             candidates = safeOutgoing;
+          } else {
+            const terminalCandidates = candidates.filter((edge) => canUseTerminalTrafficCandidate(graph, vehicle, edge));
+            if (terminalCandidates.length) {
+              candidates = terminalCandidates;
+            } else {
+              return null;
+            }
           }
         }
         candidates = preferRealTrafficEdges(candidates);
@@ -3530,6 +3618,21 @@
           weight *= 0.84 + rng() * 0.36 + (((salt + 7) * (index + 17)) % 11) / 80;
           return { item: edge, weight: Math.max(0.01, weight) };
         }));
+      }
+
+      function canUseTerminalTrafficCandidate(graph, vehicle, edge) {
+        if (!edge || hasSustainedForwardPathAfterEdge(graph, edge)) {
+          return Boolean(edge);
+        }
+        if (vehicle.targetNode && edge.to === vehicle.targetNode) {
+          return true;
+        }
+        if (vehicle.destinationKind === "outside"
+          && (!vehicle.targetNode || edge.to === vehicle.targetNode)
+          && isBoundaryDeadEndNode(graph, edge.to, edge)) {
+          return true;
+        }
+        return canStopOrParkOnEdge(edge);
       }
 
       function shouldHoldMainRoad(vehicle, incomingEdge, nextEdge, alternatives) {
@@ -4793,6 +4896,19 @@
             && isTrafficSyntheticTraversable(nextEdge));
       }
 
+      function hasSustainedForwardPathAfterEdge(graph, edge) {
+        if (!hasImmediateForwardExit(graph, edge)) {
+          return false;
+        }
+        if (!graph.precomputed) {
+          return hasCachedForwardPathAfterEdge(graph, edge);
+        }
+        if (edge.rank >= 6 || isElevatedOrExpressway(edge) || (edge.length || 0) < 8) {
+          return hasCachedForwardPathAfterEdge(graph, edge);
+        }
+        return true;
+      }
+
       function isTrafficSyntheticTraversable(edge) {
         if (!edge.synthetic) return true;
         if (edge.syntheticKind === "short-extension") return edge.length <= (edge.rank >= 6 ? 18 : 8);
@@ -4819,41 +4935,42 @@
           return false;
         }
         const sameRoad = nextEdge.roadId === incomingEdge.roadId;
+        const sameCorridor = sameRoad || isSameNamedTrafficRoad(incomingEdge, nextEdge);
         const incomingLink = isLinkEdge(incomingEdge);
         const nextLink = isLinkEdge(nextEdge);
         const incomingSeparated = isGradeSeparatedEdge(incomingEdge);
         const nextSeparated = isGradeSeparatedEdge(nextEdge);
         const gradeChanges = edgeGradeSignature(incomingEdge) !== edgeGradeSignature(nextEdge);
+        const straightGradeContinuation = isStraightGradeContinuation(incomingEdge, nextEdge, alignment);
 
         if (incomingSeparated && gradeChanges && !incomingLink && !nextLink) {
-          const straightContinuation = alignment > 0.86 && (sameRoad || nextEdge.rank >= incomingEdge.rank - 1);
-          if (!straightContinuation) {
+          if (!straightGradeContinuation) {
             return false;
           }
         }
 
-        if (!incomingSeparated && nextSeparated && isElevatedMainline(nextEdge) && !incomingLink && !nextLink && !sameRoad) {
+        if (!incomingSeparated && nextSeparated && isElevatedMainline(nextEdge) && !incomingLink && !nextLink && !sameCorridor && !straightGradeContinuation) {
           return false;
         }
 
         if (isElevatedMainline(incomingEdge) && !nextLink) {
-          if (!nextSeparated && nextEdge.rank <= 5 && !sameRoad) {
+          if (!nextSeparated && nextEdge.rank <= 5 && !sameCorridor && !straightGradeContinuation) {
             return false;
           }
-          if (alignment < 0.52 && !sameRoad && nextEdge.rank < incomingEdge.rank) {
+          if (alignment < 0.52 && !sameCorridor && nextEdge.rank < incomingEdge.rank) {
             return false;
           }
         }
 
-        if (incomingEdge.rank >= 8 && !incomingLink && !nextLink && nextEdge.rank <= 5 && !sameRoad) {
+        if (incomingEdge.rank >= 8 && !incomingLink && !nextLink && nextEdge.rank <= 5 && !sameCorridor && !straightGradeContinuation) {
           return false;
         }
 
-        if (incomingEdge.rank >= 7 && !nextLink && nextEdge.rank <= 4 && alignment < 0.82 && !sameRoad) {
+        if (incomingEdge.rank >= 7 && !nextLink && nextEdge.rank <= 4 && alignment < 0.82 && !sameCorridor) {
           return false;
         }
 
-        if (incomingSeparated && !nextSeparated && !incomingLink && !nextLink && nextEdge.rank < incomingEdge.rank && alignment < 0.86 && !sameRoad) {
+        if (incomingSeparated && !nextSeparated && !incomingLink && !nextLink && nextEdge.rank < incomingEdge.rank && alignment < 0.86 && !sameCorridor && !straightGradeContinuation) {
           return false;
         }
 
@@ -4873,6 +4990,49 @@
           return "none";
         }
         return `${edge.layer || 0}:${edge.bridge ? 1 : 0}:${edge.tunnel ? 1 : 0}`;
+      }
+
+      function isStraightGradeContinuation(incomingEdge, nextEdge, alignment) {
+        if (!incomingEdge || !nextEdge || alignment <= 0.86 || isLinkEdge(incomingEdge) || isLinkEdge(nextEdge)) {
+          return false;
+        }
+        const sameRoad = incomingEdge.roadId === nextEdge.roadId;
+        const sameName = isSameNamedTrafficRoad(incomingEdge, nextEdge);
+        const sameFamily = sameHighwayFamily(incomingEdge, nextEdge);
+        const minRank = Math.min(incomingEdge.rank, nextEdge.rank);
+        const rankCompatible = Math.abs(nextEdge.rank - incomingEdge.rank) <= 1
+          || (sameName && minRank >= 3)
+          || (sameFamily && minRank >= 5 && alignment > 0.94);
+        if (!rankCompatible) {
+          return false;
+        }
+        if (sameRoad || sameName) {
+          return true;
+        }
+        if (sameFamily && minRank >= 3) {
+          return true;
+        }
+        return alignment > 0.94 && minRank >= 5;
+      }
+
+      function isSameNamedTrafficRoad(firstEdge, secondEdge) {
+        const firstName = trafficRoadName(firstEdge);
+        const secondName = trafficRoadName(secondEdge);
+        return Boolean(firstName && secondName && firstName === secondName);
+      }
+
+      function trafficRoadName(edge) {
+        const road = edge ? roadLookup.get(String(edge.roadId)) : null;
+        return road && road.name ? String(road.name).trim() : "";
+      }
+
+      function sameHighwayFamily(firstEdge, secondEdge) {
+        if (!firstEdge || !secondEdge) {
+          return false;
+        }
+        const first = String(firstEdge.highway || "").replace(/_link$/, "");
+        const second = String(secondEdge.highway || "").replace(/_link$/, "");
+        return Boolean(first && second && first === second);
       }
 
       function isElevatedMainline(edge) {
@@ -4967,6 +5127,10 @@
         let minY = Infinity;
         let maxY = -Infinity;
         const edges = new Set();
+        const edgeSequence = [];
+        let pathDistance = 0;
+        let previousSample = null;
+        let previousEdge = "";
         samples.forEach((sample) => {
           minX = Math.min(minX, sample.x);
           maxX = Math.max(maxX, sample.x);
@@ -4974,11 +5138,29 @@
           maxY = Math.max(maxY, sample.y);
           if (sample.edge) {
             edges.add(sample.edge);
+            if (sample.edge !== previousEdge) {
+              edgeSequence.push(sample.edge);
+              previousEdge = sample.edge;
+            }
           }
+          if (previousSample) {
+            pathDistance += distance(previousSample, sample);
+          }
+          previousSample = sample;
         });
         const width = maxX - minX;
         const height = maxY - minY;
-        return width < 76 && height < 76 && edges.size >= 8;
+        const firstSample = samples[0];
+        const lastSample = samples[samples.length - 1];
+        const netDisplacement = firstSample && lastSample ? distance(firstSample, lastSample) : Infinity;
+        const repeatedEdgeVisits = edgeSequence.length - new Set(edgeSequence).size;
+        const compactMotion = width < 76 && height < 76;
+        const returnedNearStart = netDisplacement < 38;
+        const travelledEnough = pathDistance > 260 || edgeSequence.length >= 12;
+        return compactMotion
+          && travelledEnough
+          && repeatedEdgeVisits >= 2
+          && (returnedNearStart || edges.size <= 7);
       }
 
       function maybeStopAtIntersection(vehicle, nodeId, incomingEdge, nextEdge, alignment, timestamp) {

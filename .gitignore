@@ -1,3 +1,6 @@
 node_modules/
 .playwright-cli/
 tools/cache/
+test-results/topology-gap-debug.json
+test-results/topology-gap-annotation-server*.log
+test-results/traffic-diagnose-*-after-fix*.json
