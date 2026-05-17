@@ -5844,31 +5844,8 @@
       }
 
       function drawTransfers(context, timestamp) {
-        context.save();
-        activeTransfers.forEach((transfer) => {
-          const progress = Math.min(1, (timestamp - transfer.startTime) / transfer.duration);
-          const alpha = 1 - progress * 0.3;
-          const pulseRadius = 18 + progress * 54;
-
-          context.save();
-          context.globalCompositeOperation = "screen";
-          context.strokeStyle = withAlpha(transfer.toChainColor, 0.55 * alpha);
-          context.lineWidth = 2.2;
-          context.beginPath();
-          context.arc(transfer.point[0], transfer.point[1], pulseRadius, 0, Math.PI * 2);
-          context.stroke();
-
-          context.strokeStyle = withAlpha(transfer.fromChainColor, 0.42 * alpha);
-          context.lineWidth = 1.4;
-          context.beginPath();
-          context.arc(transfer.point[0], transfer.point[1], 12 + progress * 30, 0, Math.PI * 2);
-          context.stroke();
-
-          drawBeam(context, transfer.fromAnchor, transfer.point, transfer.fromChainColor, progress, alpha);
-          drawBeam(context, transfer.point, transfer.toAnchor, transfer.toChainColor, progress, alpha);
-          context.restore();
-        });
-        context.restore();
+        // Cross-chain events still update state, logs, counters, and overlays.
+        // The map-level pulse rings and curved beam particles are intentionally disabled.
       }
 
       function drawVehicles(context) {
